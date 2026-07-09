@@ -315,12 +315,12 @@ fn read_file(
 ) -> Result<u64> {
     let file = File::open(path)?;
     let file_size = file.metadata()?.len() as usize;
-    pb.set_length(file_size as u64);
 
     if let Some(kind) = compressed_kind(path) {
         drop(file); // reopened inside open_compressed_reader
         let mut reader = open_compressed_reader(path, &kind)?;
         let mut bytes_read: u64 = 0;
+        let mut last_reported: u64 = 0;
         let mut local: FastMap<Vec<u8>, u64> = FastMap::default();
         let mut line_buf: Vec<u8> = Vec::with_capacity(256);
         let mut total_lines: u64 = 0;
@@ -338,14 +338,18 @@ fn read_file(
             total_lines += 1;
             line_count += 1;
             if line_count >= 16384 {
-                pb.set_position(bytes_read);
+                // inc() adds a delta on top of the bar's current (cumulative,
+                // across all files) position — unlike set_position(), it
+                // never resets progress made by files processed earlier.
+                pb.inc(bytes_read - last_reported);
+                last_reported = bytes_read;
                 line_count = 0;
             }
             if let Some(pw) = extract_password(&line_buf, keep_trailing_colon) {
                 bump_count(&mut local, pw);
             }
         }
-        pb.set_position(bytes_read);
+        pb.inc(bytes_read - last_reported);
         fold_into_dashmap(global, local);
         Ok(total_lines)
     } else {
@@ -355,7 +359,7 @@ fn read_file(
         {
             let _ = mmap.advise(memmap2::Advice::Sequential);
         }
-        const IO_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+        const IO_CHUNK_SIZE: usize = 16 * 1024 * 1024;
         let chunks = split_into_chunks(&mmap, IO_CHUNK_SIZE);
         eprintln!("Split into {} chunks.", chunks.len());
 
