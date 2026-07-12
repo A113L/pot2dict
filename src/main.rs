@@ -3,20 +3,31 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bumpalo::Bump;
 use clap::Parser;
 use dashmap::DashMap;
+// NOTE: DashMap::par_iter() / into_par_iter() require the "rayon" feature
+// on the `dashmap` dependency in Cargo.toml (e.g. `dashmap = { version =
+// "6", features = ["rayon"] }`).
 use flate2::read::MultiGzDecoder;
 use hashbrown::HashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::{Mmap, MmapMut};
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 use std::hash::BuildHasherDefault;
+// NOTE: new dependency - add `crossbeam-channel = "0.5"` to Cargo.toml.
+use crossbeam_channel::{bounded, Sender};
+
+// --- Perf: mimalloc as global allocator ---------------------------------
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use rustc_hash::FxHasher;
 use sysinfo::{Disks, System};
 use tempfile::NamedTempFile;
@@ -24,6 +35,14 @@ use tempfile::NamedTempFile;
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 pub type GlobalMap = DashMap<Vec<u8>, u64, FxBuildHasher>;
 const GLOBAL_MAP_SHARDS: usize = 1024;
+
+// --- Perf: SmallVec keys for local per-chunk maps ------------------------
+// Most passwords are well under 24 bytes. Using an inline-storage key
+// means the hot "occupied entry, bump count" path (the overwhelming
+// majority of inserts on a large wordlist) never touches the heap at all;
+// only the cold vacant-insert path allocates, and only when a password
+// doesn't fit in 24 inline bytes.
+type PwKey = SmallVec<[u8; 24]>;
 
 struct ArenaPool {
     arenas: Vec<Bump>,
@@ -80,8 +99,18 @@ fn extract_password(line: &[u8], keep_trailing_colon: bool) -> Option<&[u8]> {
 }
 
 #[inline(always)]
-fn bump_count(map: &mut FastMap<Vec<u8>, u64>, pw: &[u8]) {
-    *map.entry_ref(pw).or_insert(0) += 1;
+fn bump_count(map: &mut FastMap<PwKey, u64>, pw: &[u8]) {
+    // raw_entry_mut lets us probe by &[u8] directly - the SmallVec key is
+    // only constructed on the vacant (first-seen) path, not on every
+    // repeated-key increment.
+    match map.raw_entry_mut().from_key(pw) {
+        hashbrown::hash_map::RawEntryMut::Occupied(mut e) => {
+            *e.get_mut() += 1;
+        }
+        hashbrown::hash_map::RawEntryMut::Vacant(e) => {
+            e.insert(PwKey::from_slice(pw), 1);
+        }
+    }
 }
 
 #[inline(always)]
@@ -97,7 +126,7 @@ fn bump_count_arena(map: &mut FastMap<&'static [u8], u64>, pool: &'static ArenaP
     }
 }
 
-fn count_chunk(chunk: &[u8], keep_trailing_colon: bool) -> FastMap<Vec<u8>, u64> {
+fn count_chunk(chunk: &[u8], keep_trailing_colon: bool) -> FastMap<PwKey, u64> {
     let mut map = FastMap::default();
     map.reserve(chunk.len() / 12 + 16);
     let mut start = 0usize;
@@ -141,32 +170,47 @@ fn count_chunk_arena(
 
 const PER_ENTRY_OVERHEAD_BYTES: usize = 48;
 
-// Cache disk info once; refreshing Disks on every spill is a major bottleneck.
-static DISK_INFO: OnceLock<Vec<(PathBuf, u64)>> = OnceLock::new();
+// --- Perf: cached Disks list ---------------------------------------------
+struct DiskCache {
+    disks: Disks,
+    last_refresh: Instant,
+}
 
-#[inline]
+static DISK_CACHE: OnceLock<Mutex<DiskCache>> = OnceLock::new();
+const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+fn with_refreshed_disks<T>(f: impl FnOnce(&Disks) -> T) -> T {
+    let cache = DISK_CACHE.get_or_init(|| {
+        Mutex::new(DiskCache {
+            disks: Disks::new_with_refreshed_list(),
+            last_refresh: Instant::now(),
+        })
+    });
+    let mut guard = cache.lock();
+    if guard.last_refresh.elapsed() >= DISK_REFRESH_INTERVAL {
+        guard.disks.refresh();
+        guard.last_refresh = Instant::now();
+    }
+    f(&guard.disks)
+}
+
 fn available_space_for(path: &std::path::Path) -> Option<u64> {
     let probe = if path.exists() {
         path.to_path_buf()
     } else {
         path.ancestors().find(|p| p.exists())?.to_path_buf()
     };
+    let probe = probe.canonicalize().ok()?;
 
-    let info = DISK_INFO.get_or_init(|| {
-        let disks = Disks::new_with_refreshed_list();
+    with_refreshed_disks(|disks| {
         disks
             .iter()
-            .map(|d| (d.mount_point().to_path_buf(), d.available_space()))
-            .collect()
-    });
-
-    info.iter()
-        .filter(|(mount, _)| probe.starts_with(mount))
-        .max_by_key(|(mount, _)| mount.as_os_str().len())
-        .map(|(_, space)| *space)
+            .filter(|d| probe.starts_with(d.mount_point()))
+            .max_by_key(|d| d.mount_point().as_os_str().len())
+            .map(|d| d.available_space())
+    })
 }
 
-#[inline]
 fn ensure_disk_space(dir: &std::path::Path, estimated_bytes: u64, context: &str) -> Result<()> {
     const SAFETY_MARGIN: f64 = 1.15;
     const WARN_MULTIPLIER: f64 = 2.0;
@@ -209,17 +253,88 @@ pub enum FinalizedResult {
     },
 }
 
+/// A drained-and-summed batch of entries waiting to be sorted, serialized,
+/// and pushed to disk by the background spill-writer thread.
+struct SpillJob {
+    entries: Vec<(Vec<u8>, u64)>,
+}
+
 pub struct CountingIndex {
     map: GlobalMap,
     approx_bytes: AtomicUsize,
     budget_bytes: usize,
     temp_dir: Option<PathBuf>,
-    spilled_runs: Mutex<Vec<tempfile::TempPath>>,
+    spilled_runs: Arc<Mutex<Vec<tempfile::TempPath>>>,
     spill_lock: RwLock<()>,
+    spill_tx: Sender<SpillJob>,
+    spill_thread: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
+    // Progress bar used to report spill activity as a live, in-place
+    // status message instead of one-off eprintln! lines - avoids
+    // scrolling the terminal with a new line on every spill, and the
+    // message disappears automatically when the bar is finish_and_clear()'d.
+    progress: ProgressBar,
+    spill_count: AtomicUsize,
 }
 
 impl CountingIndex {
-    fn new(budget_bytes: usize, temp_dir: Option<PathBuf>) -> Self {
+    fn new(budget_bytes: usize, temp_dir: Option<PathBuf>, progress: ProgressBar) -> Self {
+        let spilled_runs = Arc::new(Mutex::new(Vec::new()));
+
+        // --- Perf: background spill-writer thread + bounded channel -----
+        // Previously, maybe_spill() sorted, serialized, and fsync'd a run
+        // inline, while holding spill_lock.write() - every counting
+        // thread was blocked waiting to acquire spill_lock.read() in
+        // fold_into_dashmap() until the write finished. On spill-heavy
+        // runs (many spills across a big job) this repeatedly stalled the
+        // whole rayon pool.
+        //
+        // Now maybe_spill() only drains + hands off a SpillJob and
+        // returns immediately; a dedicated thread does the sort/serialize
+        // /write. The channel's bounded depth (2) provides backpressure:
+        // if disk I/O can't keep up, counting threads block on send()
+        // rather than piling up unbounded pending jobs in memory.
+        let (tx, rx) = bounded::<SpillJob>(2);
+        let writer_temp_dir = temp_dir.clone();
+        let writer_runs = Arc::clone(&spilled_runs);
+        let spill_thread = std::thread::Builder::new()
+            .name("spill-writer".into())
+            .spawn(move || -> Result<()> {
+                while let Ok(job) = rx.recv() {
+                    let spill_dir = writer_temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+                    let approx_bytes: u64 = job
+                        .entries
+                        .iter()
+                        .map(|(k, _)| (k.len() + PER_ENTRY_OVERHEAD_BYTES) as u64)
+                        .sum();
+                    ensure_disk_space(&spill_dir, approx_bytes, "counting-phase spill")?;
+
+                    let mut entries = job.entries;
+                    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+                    let temp = if let Some(ref dir) = writer_temp_dir {
+                        NamedTempFile::new_in(dir)?
+                    } else {
+                        NamedTempFile::new()?
+                    };
+                    {
+                        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
+                        for (pw, count) in &entries {
+                            write_record(
+                                &mut writer,
+                                &Record {
+                                    key: *count as i64,
+                                    pw: pw.clone(),
+                                },
+                            )?;
+                        }
+                        writer.flush()?;
+                    }
+                    writer_runs.lock().push(temp.into_temp_path());
+                }
+                Ok(())
+            })
+            .expect("failed to spawn spill-writer thread");
+
         CountingIndex {
             map: DashMap::with_capacity_and_hasher_and_shard_amount(
                 1 << 20,
@@ -229,8 +344,12 @@ impl CountingIndex {
             approx_bytes: AtomicUsize::new(0),
             budget_bytes,
             temp_dir,
-            spilled_runs: Mutex::new(Vec::new()),
+            spilled_runs,
             spill_lock: RwLock::new(()),
+            spill_tx: tx,
+            spill_thread: Mutex::new(Some(spill_thread)),
+            progress,
+            spill_count: AtomicUsize::new(0),
         }
     }
 
@@ -242,7 +361,7 @@ impl CountingIndex {
         if self.approx_bytes.load(AtomicOrdering::Relaxed) < self.budget_bytes {
             return Ok(());
         }
-        let _guard = self.spill_lock.write().unwrap();
+        let _guard = self.spill_lock.write();
         if self.approx_bytes.load(AtomicOrdering::Relaxed) < self.budget_bytes {
             return Ok(());
         }
@@ -251,69 +370,64 @@ impl CountingIndex {
         }
         let approx_bytes_now = self.approx_bytes.load(AtomicOrdering::Relaxed) as u64;
         let approx_gb = approx_bytes_now as f64 / (1024.0 * 1024.0 * 1024.0);
-        let run_num = {
-            let runs = self.spilled_runs.lock().unwrap();
-            runs.len() + 1
-        };
-        eprintln!(
-            "Counting working set (~{:.2} GB) exceeds memory budget; spilling to disk (run #{}).",
-            approx_gb, run_num
-        );
+        let spill_num = self.spill_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        // Update the progress bar's message in place rather than
+        // eprintln!'ing a new line per spill - indicatif redraws this
+        // over the previous message, and it's cleared automatically when
+        // the bar is finish_and_clear()'d once counting completes.
+        self.progress.set_message(format!(
+            "spilled {} run{} to disk (~{:.2} GB this run)",
+            spill_num,
+            if spill_num == 1 { "" } else { "s" },
+            approx_gb
+        ));
 
-        ensure_disk_space(&self.spill_dir(), approx_bytes_now, "counting-phase spill")?;
-
-        // Sequential collection (DashMap rayon feature not enabled)
-        let mut entries: Vec<(Vec<u8>, u64)> = self
+        let entries: Vec<(Vec<u8>, u64)> = self
             .map
-            .iter()
+            .par_iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
         self.map.clear();
         self.approx_bytes.store(0, AtomicOrdering::Relaxed);
 
-        entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let temp = if let Some(ref dir) = self.temp_dir {
-            NamedTempFile::new_in(dir)?
-        } else {
-            NamedTempFile::new()?
-        };
-        {
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
-            for (pw, count) in &entries {
-                write_record(
-                    &mut writer,
-                    &Record {
-                        key: *count as i64,
-                        pw: pw.clone(),
-                    },
-                )?;
-            }
-            writer.flush()?;
-        }
-        self.spilled_runs.lock().unwrap().push(temp.into_temp_path());
+        // Blocks only if the writer's queue (depth 2) is already full -
+        // intentional backpressure, not a bug.
+        self.spill_tx
+            .send(SpillJob { entries })
+            .map_err(|_| anyhow::anyhow!("spill-writer thread terminated unexpectedly"))?;
         Ok(())
     }
 
     fn has_spilled(&self) -> bool {
-        !self.spilled_runs.lock().unwrap().is_empty()
+        !self.spilled_runs.lock().is_empty()
     }
 
     fn finalize(self, sort_mode: &str) -> Result<FinalizedResult> {
         let spill_dir = self.spill_dir();
-        let mut spilled_runs = match self.spilled_runs.into_inner() {
-            Ok(runs) => runs,
-            Err(poisoned) => {
-                eprintln!("Warning: spilled_runs mutex was poisoned, recovering partial data.");
-                poisoned.into_inner()
-            }
+
+        // Close the channel and wait for the background writer to drain
+        // any in-flight/queued jobs before trusting spilled_runs.
+        drop(self.spill_tx);
+        if let Some(handle) = self.spill_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("spill-writer thread panicked"))??;
+        }
+
+        let mut spilled_runs = match Arc::try_unwrap(self.spilled_runs) {
+            Ok(mutex) => mutex.into_inner(),
+            // TempPath isn't Clone, so if another Arc handle is somehow
+            // still alive (shouldn't happen once the writer thread has
+            // been joined above, but be defensive), drain the Vec's
+            // contents via mem::take rather than cloning it.
+            Err(arc) => std::mem::take(&mut *arc.lock()),
         };
 
         if spilled_runs.is_empty() {
             let unique = self.map.len() as u64;
-            // Sequential conversion (DashMap rayon feature not enabled)
             let records: Vec<Record> = if sort_mode == "frequency" {
                 self.map
-                    .into_iter()
+                    .into_par_iter()
                     .map(|(pw, freq)| Record {
                         key: -(freq as i64),
                         pw,
@@ -321,7 +435,7 @@ impl CountingIndex {
                     .collect()
             } else {
                 self.map
-                    .into_iter()
+                    .into_par_iter()
                     .map(|(pw, _freq)| Record { key: 0, pw })
                     .collect()
             };
@@ -332,10 +446,9 @@ impl CountingIndex {
             let approx_bytes_now = self.approx_bytes.load(AtomicOrdering::Relaxed) as u64;
             ensure_disk_space(&spill_dir, approx_bytes_now, "final counting-phase spill")?;
 
-            // Sequential collection (DashMap rayon feature not enabled)
             let mut entries: Vec<(Vec<u8>, u64)> = self
                 .map
-                .iter()
+                .par_iter()
                 .map(|entry| (entry.key().clone(), *entry.value()))
                 .collect();
             entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -371,10 +484,10 @@ impl CountingIndex {
     }
 }
 
-fn fold_into_dashmap(index: &CountingIndex, local: FastMap<Vec<u8>, u64>) {
-    let _guard = index.spill_lock.read().unwrap();
+fn fold_into_dashmap(index: &CountingIndex, local: FastMap<PwKey, u64>) {
+    let _guard = index.spill_lock.read();
     for (k, v) in local {
-        match index.map.entry(k) {
+        match index.map.entry(k.to_vec()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
                 *e.get_mut() += v;
             }
@@ -389,7 +502,7 @@ fn fold_into_dashmap(index: &CountingIndex, local: FastMap<Vec<u8>, u64>) {
 }
 
 fn fold_into_dashmap_arena(index: &CountingIndex, local: FastMap<&'static [u8], u64>) {
-    let _guard = index.spill_lock.read().unwrap();
+    let _guard = index.spill_lock.read();
     for (k, v) in local {
         match index.map.entry(k.to_vec()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
@@ -755,7 +868,7 @@ fn read_file(
         let mut bytes_read: u64 = 0;
         let mut last_reported: u64 = 0;
         let mut lines_since_check: u64 = 0;
-        let mut local: FastMap<Vec<u8>, u64> = FastMap::default();
+        let mut local: FastMap<PwKey, u64> = FastMap::default();
         let mut line_buf: Vec<u8> = Vec::with_capacity(256);
         let mut total_lines: u64 = 0;
         let mut line_count: u64 = 0;
@@ -835,7 +948,7 @@ fn read_file(
                 batch
                     .par_iter()
                     .fold(
-                        || FastMap::<Vec<u8>, u64>::default(),
+                        || FastMap::<PwKey, u64>::default(),
                         |mut acc, chunk| {
                             let m = count_chunk(chunk, keep_trailing_colon);
                             let lines: u64 = m.values().sum();
@@ -1131,42 +1244,6 @@ struct Cli {
     parallel_files: bool,
 }
 
-fn handle_spilled<W: Write>(
-    runs: &[tempfile::TempPath],
-    sort_mode: &str,
-    max_mem_bytes: usize,
-    temp_dir: Option<PathBuf>,
-    out: &mut W,
-    write_pb: &ProgressBar,
-    total_lines: u64,
-    start: Instant,
-    out_path: Option<&PathBuf>,
-) -> Result<()> {
-    let out_name = out_path.map(|p| p.display().to_string()).unwrap_or_else(|| "stdout".to_string());
-    if sort_mode == "unique" {
-        let unique = stream_merge_and_write(runs, out, write_pb)?;
-        out.flush()?;
-        write_pb.finish_and_clear();
-        let elapsed = start.elapsed().as_secs_f32();
-        eprintln!("mode      : {}", sort_mode);
-        eprintln!("lines in  : {}", total_lines);
-        eprintln!("unique    : {} (streaming merge)", unique);
-        eprintln!("output    : {}", out_name);
-        eprintln!("time      : {:.1}s", elapsed);
-    } else {
-        let unique = external_sort_spilled_runs(runs, max_mem_bytes, temp_dir, out, write_pb)?;
-        out.flush()?;
-        write_pb.finish_and_clear();
-        let elapsed = start.elapsed().as_secs_f32();
-        eprintln!("mode      : {}", sort_mode);
-        eprintln!("lines in  : {}", total_lines);
-        eprintln!("unique    : {} (external sort)", unique);
-        eprintln!("output    : {}", out_name);
-        eprintln!("time      : {:.1}s", elapsed);
-    }
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1248,7 +1325,10 @@ fn main() -> Result<()> {
         count_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
-    let index = CountingIndex::new(count_budget_bytes, cli.temp_dir.clone());
+    // ProgressBar is internally Arc-backed, so this clone is a cheap
+    // shared handle to the same bar/line - spill status and byte-progress
+    // both render on it, and both vanish together on finish_and_clear().
+    let index = CountingIndex::new(count_budget_bytes, cli.temp_dir.clone(), pb.clone());
     let total_lines_acc = AtomicU64::new(0);
     let total_bytes: u64 = cli
         .inputs
@@ -1306,14 +1386,49 @@ fn main() -> Result<()> {
     let (unique_passwords, records) = match index.finalize(sort_mode)? {
         FinalizedResult::InMemory(u, r) => (u as usize, Some(r)),
         FinalizedResult::Spilled { runs, sort_mode: sm } => {
-            if let Some(ref out_path) = cli.output {
-                let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?);
-                handle_spilled(&runs, &sm, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb, total_lines, start, cli.output.as_ref())?;
+            if sm == "unique" {
+                let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
+                } else {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
+                };
+                let unique = stream_merge_and_write(&runs, &mut out, &write_pb)?;
+                out.flush()?;
+                write_pb.finish_and_clear();
+
+                let elapsed = start.elapsed().as_secs_f32();
+                let out_name = cli.output.as_deref().unwrap_or(std::path::Path::new("stdout")).display();
+                eprintln!("mode      : {}", sort_mode);
+                eprintln!("lines in  : {}", total_lines);
+                eprintln!("unique    : {} (streaming merge)", unique);
+                eprintln!("output    : {}", out_name);
+                eprintln!("time      : {:.1}s", elapsed);
+                return Ok(());
             } else {
-                let mut out = BufWriter::with_capacity(16 * 1024 * 1024, io::stdout());
-                handle_spilled(&runs, &sm, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb, total_lines, start, None)?;
+                let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
+                } else {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
+                };
+                let unique = external_sort_spilled_runs(
+                    &runs,
+                    max_mem_bytes,
+                    cli.temp_dir.clone(),
+                    &mut out,
+                    &write_pb,
+                )?;
+                out.flush()?;
+                write_pb.finish_and_clear();
+
+                let elapsed = start.elapsed().as_secs_f32();
+                let out_name = cli.output.as_deref().unwrap_or(std::path::Path::new("stdout")).display();
+                eprintln!("mode      : {}", sort_mode);
+                eprintln!("lines in  : {}", total_lines);
+                eprintln!("unique    : {} (external sort)", unique);
+                eprintln!("output    : {}", out_name);
+                eprintln!("time      : {:.1}s", elapsed);
+                return Ok(());
             }
-            return Ok(());
         }
     };
 
@@ -1343,17 +1458,20 @@ fn main() -> Result<()> {
             records.par_sort_unstable();
             write_output_mmap(&records, cli.output.as_ref().unwrap(), &write_pb)?;
         } else {
-            let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(cli.output.as_ref().unwrap())?);
-            sort_and_write(records, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb)?;
+            let mut out: Box<dyn Write> = Box::new(BufWriter::with_capacity(
+                16 * 1024 * 1024,
+                File::create(cli.output.as_ref().unwrap())?,
+            ));
+            sort_and_write(records, max_mem_bytes, cli.temp_dir, &mut out, &write_pb)?;
             out.flush()?;
         }
-    } else if let Some(ref out_path) = cli.output {
-        let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?);
-        sort_and_write(records, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb)?;
-        out.flush()?;
     } else {
-        let mut out = BufWriter::with_capacity(16 * 1024 * 1024, io::stdout());
-        sort_and_write(records, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb)?;
+        let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
+            Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
+        } else {
+            Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
+        };
+        sort_and_write(records, max_mem_bytes, cli.temp_dir, &mut out, &write_pb)?;
         out.flush()?;
     }
     write_pb.finish_and_clear();
