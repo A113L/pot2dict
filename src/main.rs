@@ -240,6 +240,7 @@ pub enum FinalizedResult {
 
 struct SpillJob {
     entries: Vec<(Vec<u8>, u64)>,
+    run_number: usize,
 }
 
 pub struct CountingIndex {
@@ -262,6 +263,7 @@ impl CountingIndex {
         let (tx, rx) = bounded::<SpillJob>(2);
         let writer_temp_dir = temp_dir.clone();
         let writer_runs = Arc::clone(&spilled_runs);
+        let writer_progress = progress.clone();
         let spill_thread = std::thread::Builder::new()
             .name("spill-writer".into())
             .spawn(move || -> Result<()> {
@@ -279,6 +281,13 @@ impl CountingIndex {
 
                     let temp_path = write_entries_to_temp(&entries, &writer_temp_dir, false)?;
                     writer_runs.lock().push(temp_path);
+                    
+                    // Notify that this spill run has been written to disk
+                    writer_progress.set_message(format!(
+                        "spill run #{} written to disk ({} entries)",
+                        job.run_number,
+                        entries.len()
+                    ));
                 }
                 Ok(())
             })
@@ -331,9 +340,8 @@ impl CountingIndex {
         let approx_gb = approx_bytes_now as f64 / (1024.0 * 1024.0 * 1024.0);
         let spill_num = self.spill_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         self.progress.set_message(format!(
-            "spilled {} run{} to disk (~{:.2} GB this run)",
+            "spilling run #{} to disk (~{:.2} GB)...",
             spill_num,
-            if spill_num == 1 { "" } else { "s" },
             approx_gb
         ));
 
@@ -349,7 +357,7 @@ impl CountingIndex {
         // Release write lock BEFORE blocking send
         drop(_guard);
 
-        tx.send(SpillJob { entries })
+        tx.send(SpillJob { entries, run_number: spill_num })
             .map_err(|_| anyhow::anyhow!("spill-writer thread terminated unexpectedly"))?;
         Ok(())
     }
