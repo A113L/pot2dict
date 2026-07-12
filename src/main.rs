@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::hash::BuildHasherDefault;
 use rustc_hash::FxHasher;
-use sysinfo::System;
+use sysinfo::{Disks, System};
 use tempfile::NamedTempFile;
 
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -141,6 +141,71 @@ fn count_chunk_arena(
 
 const PER_ENTRY_OVERHEAD_BYTES: usize = 48;
 
+/// Finds the available free space (in bytes) on the filesystem that
+/// contains `path`, by matching the longest mount-point prefix.
+/// Returns None if it can't be determined (e.g. path doesn't exist yet,
+/// or platform quirks) - callers should treat None as "unknown, don't block".
+fn available_space_for(path: &std::path::Path) -> Option<u64> {
+    let probe = if path.exists() {
+        path.to_path_buf()
+    } else {
+        // Directory might not exist yet as a full path segment (e.g. a
+        // --temp-dir that hasn't been created); walk up to the nearest
+        // existing ancestor so we still probe the right filesystem.
+        path.ancestors().find(|p| p.exists())?.to_path_buf()
+    };
+    let probe = probe.canonicalize().ok()?;
+
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|d| probe.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
+/// Checks that `dir` has enough free space for an upcoming write of
+/// approximately `estimated_bytes`. Applies a safety margin (spilled
+/// records are re-serialized with per-record length prefixes, and
+/// external-merge temporarily needs both the old runs and the new
+/// merged run on disk at once).
+/// Returns Err (aborting the run) if space is clearly insufficient,
+/// or prints a warning if it's getting tight but not yet fatal.
+fn ensure_disk_space(dir: &std::path::Path, estimated_bytes: u64, context: &str) -> Result<()> {
+    const SAFETY_MARGIN: f64 = 1.15; // 15% headroom for serialization overhead
+    const WARN_MULTIPLIER: f64 = 2.0; // warn while there's still 2x required space left
+
+    let Some(avail) = available_space_for(dir) else {
+        // Can't determine free space on this platform/path; don't block the run.
+        return Ok(());
+    };
+
+    let required = (estimated_bytes as f64 * SAFETY_MARGIN) as u64;
+
+    if avail < required {
+        anyhow::bail!(
+            "Not enough disk space in '{}' for {}: need ~{:.2} GB (with headroom), only {:.2} GB available. \
+             Free up space, point --temp-dir at a larger volume, or lower --count-mem/--max-mem to spill smaller runs.",
+            dir.display(),
+            context,
+            required as f64 / (1024.0 * 1024.0 * 1024.0),
+            avail as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    if (avail as f64) < required as f64 * WARN_MULTIPLIER {
+        eprintln!(
+            "Warning: disk space in '{}' is getting low ({:.2} GB free; {} needs ~{:.2} GB).",
+            dir.display(),
+            avail as f64 / (1024.0 * 1024.0 * 1024.0),
+            context,
+            required as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    Ok(())
+}
+
 pub enum FinalizedResult {
     InMemory(u64, Vec<Record>),
     Spilled {
@@ -174,6 +239,10 @@ impl CountingIndex {
         }
     }
 
+    fn spill_dir(&self) -> PathBuf {
+        self.temp_dir.clone().unwrap_or_else(std::env::temp_dir)
+    }
+
     fn maybe_spill(&self) -> Result<()> {
         if self.approx_bytes.load(AtomicOrdering::Relaxed) < self.budget_bytes {
             return Ok(());
@@ -185,8 +254,8 @@ impl CountingIndex {
         if self.map.is_empty() {
             return Ok(());
         }
-        let approx_gb =
-            self.approx_bytes.load(AtomicOrdering::Relaxed) as f64 / (1024.0 * 1024.0 * 1024.0);
+        let approx_bytes_now = self.approx_bytes.load(AtomicOrdering::Relaxed) as u64;
+        let approx_gb = approx_bytes_now as f64 / (1024.0 * 1024.0 * 1024.0);
         let run_num = {
             let runs = self.spilled_runs.lock().unwrap();
             runs.len() + 1
@@ -196,10 +265,21 @@ impl CountingIndex {
             approx_gb, run_num
         );
 
-        let mut entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(self.map.len());
-        for entry in self.map.iter() {
-            entries.push((entry.key().clone(), *entry.value()));
-        }
+        // Check disk space before writing this spill run. The serialized
+        // spill file is roughly the same order of magnitude as the
+        // in-memory approximation (key bytes + length-prefixed records),
+        // so approx_bytes_now is a reasonable estimate.
+        ensure_disk_space(&self.spill_dir(), approx_bytes_now, "counting-phase spill")?;
+
+        // Parallel collection across all threads (requires dashmap's
+        // "rayon" feature). This used to be a single-threaded `for entry in
+        // self.map.iter()` loop, which became a real bottleneck right
+        // before every spill on large working sets.
+        let mut entries: Vec<(Vec<u8>, u64)> = self
+            .map
+            .par_iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
         self.map.clear();
         self.approx_bytes.store(0, AtomicOrdering::Relaxed);
 
@@ -231,6 +311,7 @@ impl CountingIndex {
     }
 
     fn finalize(self, sort_mode: &str) -> Result<FinalizedResult> {
+        let spill_dir = self.spill_dir();
         let mut spilled_runs = match self.spilled_runs.into_inner() {
             Ok(runs) => runs,
             Err(poisoned) => {
@@ -241,9 +322,14 @@ impl CountingIndex {
 
         if spilled_runs.is_empty() {
             let unique = self.map.len() as u64;
-            let records = if sort_mode == "frequency" {
+            // Parallel conversion across all threads (requires dashmap's
+            // "rayon" feature). This is the whole in-memory working set
+            // (potentially hundreds of millions of entries when nothing
+            // ever spilled), so a sequential `.into_iter()` here was the
+            // single biggest single-threaded stretch in the whole run.
+            let records: Vec<Record> = if sort_mode == "frequency" {
                 self.map
-                    .into_iter()
+                    .into_par_iter()
                     .map(|(pw, freq)| Record {
                         key: -(freq as i64),
                         pw,
@@ -251,7 +337,7 @@ impl CountingIndex {
                     .collect()
             } else {
                 self.map
-                    .into_iter()
+                    .into_par_iter()
                     .map(|(pw, _freq)| Record { key: 0, pw })
                     .collect()
             };
@@ -259,10 +345,14 @@ impl CountingIndex {
         }
 
         if !self.map.is_empty() {
-            let mut entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(self.map.len());
-            for entry in self.map.iter() {
-                entries.push((entry.key().clone(), *entry.value()));
-            }
+            let approx_bytes_now = self.approx_bytes.load(AtomicOrdering::Relaxed) as u64;
+            ensure_disk_space(&spill_dir, approx_bytes_now, "final counting-phase spill")?;
+
+            let mut entries: Vec<(Vec<u8>, u64)> = self
+                .map
+                .par_iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect();
             entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
             let temp = if let Some(ref dir) = self.temp_dir {
                 NamedTempFile::new_in(dir)?
@@ -440,6 +530,18 @@ fn external_sort_spilled_runs(
         }
     }
 
+    let spill_dir = temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+
+    // Estimate the size of the fully-merged run: sum of all input run sizes
+    // (records carry over 1:1 into the merged file, just deduplicated/summed,
+    // so this is a safe upper bound).
+    let runs_total_bytes: u64 = runs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    ensure_disk_space(&spill_dir, runs_total_bytes, "merged counting run")?;
+
     let merged = if let Some(ref dir) = temp_dir {
         NamedTempFile::new_in(dir)?
     } else {
@@ -534,6 +636,9 @@ fn external_sort_spilled_runs(
             break;
         }
         chunk.par_sort_unstable();
+
+        // Each per-chunk sorted run is roughly chunk_bytes on disk.
+        ensure_disk_space(&spill_dir, chunk_bytes as u64, "sorted chunk run")?;
 
         let temp = if let Some(ref dir) = temp_dir {
             NamedTempFile::new_in(dir)?
@@ -849,6 +954,16 @@ fn write_output_mmap(records: &[Record], out_path: &PathBuf, progress: &Progress
     }
     let total_size = acc as u64;
 
+    // Check space on the filesystem that will hold the output file itself.
+    if let Some(parent) = out_path.parent() {
+        let probe = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        ensure_disk_space(probe, total_size, "mmap output file")?;
+    }
+
     let file = File::create(out_path)?;
     file.set_len(total_size)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -896,6 +1011,11 @@ fn sort_and_write(
     }
 
     eprintln!("Dataset exceeds in-memory sort budget; spilling to disk.");
+
+    let spill_dir = temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+    // Estimate on-disk size of all spilled chunk runs combined (roughly
+    // equal to the in-memory estimate, serialized).
+    ensure_disk_space(&spill_dir, estimated_mem as u64, "sort-phase spill (all chunks)")?;
 
     let avg_record_size: usize = if records.is_empty() {
         1
@@ -1047,6 +1167,45 @@ fn main() -> Result<()> {
     sys.refresh_memory();
     let total_ram = sys.total_memory() as usize;
     let max_mem_bytes = (total_ram as f64 * cli.max_mem) as usize;
+
+    // Upfront disk-space sanity check: warn (not fail) if the temp/output
+    // filesystem already looks tight before we've written a single byte.
+    {
+        let probe_dir = cli
+            .temp_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        if let Some(avail) = available_space_for(&probe_dir) {
+            let avail_gb = avail as f64 / (1024.0 * 1024.0 * 1024.0);
+            eprintln!(
+                "Temp/spill directory: {} ({:.2} GB free)",
+                probe_dir.display(),
+                avail_gb
+            );
+            let total_input_bytes: u64 = cli
+                .inputs
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .sum();
+            // Rough heuristic: worst case, spilling can write out roughly
+            // as much data as the input itself (before dedup collapses it).
+            // Just warn here; the per-spill checks below are authoritative.
+            if total_input_bytes > 0 && avail < total_input_bytes {
+                eprintln!(
+                    "Warning: free space ({:.2} GB) is less than total input size ({:.2} GB). \
+                     Large inputs with low duplication may exhaust disk space during spilling.",
+                    avail_gb,
+                    total_input_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+        } else {
+            eprintln!(
+                "Warning: could not determine free space for '{}'; disk-space checks during spilling will be skipped.",
+                probe_dir.display()
+            );
+        }
+    }
 
     let sort_mode = if cli.unique {
         "unique"
