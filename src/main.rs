@@ -141,42 +141,37 @@ fn count_chunk_arena(
 
 const PER_ENTRY_OVERHEAD_BYTES: usize = 48;
 
-/// Finds the available free space (in bytes) on the filesystem that
-/// contains `path`, by matching the longest mount-point prefix.
-/// Returns None if it can't be determined (e.g. path doesn't exist yet,
-/// or platform quirks) - callers should treat None as "unknown, don't block".
+// Cache disk info once; refreshing Disks on every spill is a major bottleneck.
+static DISK_INFO: OnceLock<Vec<(PathBuf, u64)>> = OnceLock::new();
+
+#[inline]
 fn available_space_for(path: &std::path::Path) -> Option<u64> {
     let probe = if path.exists() {
         path.to_path_buf()
     } else {
-        // Directory might not exist yet as a full path segment (e.g. a
-        // --temp-dir that hasn't been created); walk up to the nearest
-        // existing ancestor so we still probe the right filesystem.
         path.ancestors().find(|p| p.exists())?.to_path_buf()
     };
-    let probe = probe.canonicalize().ok()?;
 
-    let disks = Disks::new_with_refreshed_list();
-    disks
-        .iter()
-        .filter(|d| probe.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space())
+    let info = DISK_INFO.get_or_init(|| {
+        let disks = Disks::new_with_refreshed_list();
+        disks
+            .iter()
+            .map(|d| (d.mount_point().to_path_buf(), d.available_space()))
+            .collect()
+    });
+
+    info.iter()
+        .filter(|(mount, _)| probe.starts_with(mount))
+        .max_by_key(|(mount, _)| mount.as_os_str().len())
+        .map(|(_, space)| *space)
 }
 
-/// Checks that `dir` has enough free space for an upcoming write of
-/// approximately `estimated_bytes`. Applies a safety margin (spilled
-/// records are re-serialized with per-record length prefixes, and
-/// external-merge temporarily needs both the old runs and the new
-/// merged run on disk at once).
-/// Returns Err (aborting the run) if space is clearly insufficient,
-/// or prints a warning if it's getting tight but not yet fatal.
+#[inline]
 fn ensure_disk_space(dir: &std::path::Path, estimated_bytes: u64, context: &str) -> Result<()> {
-    const SAFETY_MARGIN: f64 = 1.15; // 15% headroom for serialization overhead
-    const WARN_MULTIPLIER: f64 = 2.0; // warn while there's still 2x required space left
+    const SAFETY_MARGIN: f64 = 1.15;
+    const WARN_MULTIPLIER: f64 = 2.0;
 
     let Some(avail) = available_space_for(dir) else {
-        // Can't determine free space on this platform/path; don't block the run.
         return Ok(());
     };
 
@@ -265,19 +260,12 @@ impl CountingIndex {
             approx_gb, run_num
         );
 
-        // Check disk space before writing this spill run. The serialized
-        // spill file is roughly the same order of magnitude as the
-        // in-memory approximation (key bytes + length-prefixed records),
-        // so approx_bytes_now is a reasonable estimate.
         ensure_disk_space(&self.spill_dir(), approx_bytes_now, "counting-phase spill")?;
 
-        // Parallel collection across all threads (requires dashmap's
-        // "rayon" feature). This used to be a single-threaded `for entry in
-        // self.map.iter()` loop, which became a real bottleneck right
-        // before every spill on large working sets.
+        // Sequential collection (DashMap rayon feature not enabled)
         let mut entries: Vec<(Vec<u8>, u64)> = self
             .map
-            .par_iter()
+            .iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
         self.map.clear();
@@ -322,14 +310,10 @@ impl CountingIndex {
 
         if spilled_runs.is_empty() {
             let unique = self.map.len() as u64;
-            // Parallel conversion across all threads (requires dashmap's
-            // "rayon" feature). This is the whole in-memory working set
-            // (potentially hundreds of millions of entries when nothing
-            // ever spilled), so a sequential `.into_iter()` here was the
-            // single biggest single-threaded stretch in the whole run.
+            // Sequential conversion (DashMap rayon feature not enabled)
             let records: Vec<Record> = if sort_mode == "frequency" {
                 self.map
-                    .into_par_iter()
+                    .into_iter()
                     .map(|(pw, freq)| Record {
                         key: -(freq as i64),
                         pw,
@@ -337,7 +321,7 @@ impl CountingIndex {
                     .collect()
             } else {
                 self.map
-                    .into_par_iter()
+                    .into_iter()
                     .map(|(pw, _freq)| Record { key: 0, pw })
                     .collect()
             };
@@ -348,9 +332,10 @@ impl CountingIndex {
             let approx_bytes_now = self.approx_bytes.load(AtomicOrdering::Relaxed) as u64;
             ensure_disk_space(&spill_dir, approx_bytes_now, "final counting-phase spill")?;
 
+            // Sequential collection (DashMap rayon feature not enabled)
             let mut entries: Vec<(Vec<u8>, u64)> = self
                 .map
-                .par_iter()
+                .iter()
                 .map(|entry| (entry.key().clone(), *entry.value()))
                 .collect();
             entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -532,9 +517,6 @@ fn external_sort_spilled_runs(
 
     let spill_dir = temp_dir.clone().unwrap_or_else(std::env::temp_dir);
 
-    // Estimate the size of the fully-merged run: sum of all input run sizes
-    // (records carry over 1:1 into the merged file, just deduplicated/summed,
-    // so this is a safe upper bound).
     let runs_total_bytes: u64 = runs
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
@@ -637,7 +619,6 @@ fn external_sort_spilled_runs(
         }
         chunk.par_sort_unstable();
 
-        // Each per-chunk sorted run is roughly chunk_bytes on disk.
         ensure_disk_space(&spill_dir, chunk_bytes as u64, "sorted chunk run")?;
 
         let temp = if let Some(ref dir) = temp_dir {
@@ -954,7 +935,6 @@ fn write_output_mmap(records: &[Record], out_path: &PathBuf, progress: &Progress
     }
     let total_size = acc as u64;
 
-    // Check space on the filesystem that will hold the output file itself.
     if let Some(parent) = out_path.parent() {
         let probe = if parent.as_os_str().is_empty() {
             std::path::Path::new(".")
@@ -1013,8 +993,6 @@ fn sort_and_write(
     eprintln!("Dataset exceeds in-memory sort budget; spilling to disk.");
 
     let spill_dir = temp_dir.clone().unwrap_or_else(std::env::temp_dir);
-    // Estimate on-disk size of all spilled chunk runs combined (roughly
-    // equal to the in-memory estimate, serialized).
     ensure_disk_space(&spill_dir, estimated_mem as u64, "sort-phase spill (all chunks)")?;
 
     let avg_record_size: usize = if records.is_empty() {
@@ -1153,6 +1131,42 @@ struct Cli {
     parallel_files: bool,
 }
 
+fn handle_spilled<W: Write>(
+    runs: &[tempfile::TempPath],
+    sort_mode: &str,
+    max_mem_bytes: usize,
+    temp_dir: Option<PathBuf>,
+    out: &mut W,
+    write_pb: &ProgressBar,
+    total_lines: u64,
+    start: Instant,
+    out_path: Option<&PathBuf>,
+) -> Result<()> {
+    let out_name = out_path.map(|p| p.display().to_string()).unwrap_or_else(|| "stdout".to_string());
+    if sort_mode == "unique" {
+        let unique = stream_merge_and_write(runs, out, write_pb)?;
+        out.flush()?;
+        write_pb.finish_and_clear();
+        let elapsed = start.elapsed().as_secs_f32();
+        eprintln!("mode      : {}", sort_mode);
+        eprintln!("lines in  : {}", total_lines);
+        eprintln!("unique    : {} (streaming merge)", unique);
+        eprintln!("output    : {}", out_name);
+        eprintln!("time      : {:.1}s", elapsed);
+    } else {
+        let unique = external_sort_spilled_runs(runs, max_mem_bytes, temp_dir, out, write_pb)?;
+        out.flush()?;
+        write_pb.finish_and_clear();
+        let elapsed = start.elapsed().as_secs_f32();
+        eprintln!("mode      : {}", sort_mode);
+        eprintln!("lines in  : {}", total_lines);
+        eprintln!("unique    : {} (external sort)", unique);
+        eprintln!("output    : {}", out_name);
+        eprintln!("time      : {:.1}s", elapsed);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1168,8 +1182,6 @@ fn main() -> Result<()> {
     let total_ram = sys.total_memory() as usize;
     let max_mem_bytes = (total_ram as f64 * cli.max_mem) as usize;
 
-    // Upfront disk-space sanity check: warn (not fail) if the temp/output
-    // filesystem already looks tight before we've written a single byte.
     {
         let probe_dir = cli
             .temp_dir
@@ -1188,9 +1200,6 @@ fn main() -> Result<()> {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            // Rough heuristic: worst case, spilling can write out roughly
-            // as much data as the input itself (before dedup collapses it).
-            // Just warn here; the per-spill checks below are authoritative.
             if total_input_bytes > 0 && avail < total_input_bytes {
                 eprintln!(
                     "Warning: free space ({:.2} GB) is less than total input size ({:.2} GB). \
@@ -1297,49 +1306,14 @@ fn main() -> Result<()> {
     let (unique_passwords, records) = match index.finalize(sort_mode)? {
         FinalizedResult::InMemory(u, r) => (u as usize, Some(r)),
         FinalizedResult::Spilled { runs, sort_mode: sm } => {
-            if sm == "unique" {
-                let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
-                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
-                } else {
-                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
-                };
-                let unique = stream_merge_and_write(&runs, &mut out, &write_pb)?;
-                out.flush()?;
-                write_pb.finish_and_clear();
-
-                let elapsed = start.elapsed().as_secs_f32();
-                let out_name = cli.output.as_deref().unwrap_or(std::path::Path::new("stdout")).display();
-                eprintln!("mode      : {}", sort_mode);
-                eprintln!("lines in  : {}", total_lines);
-                eprintln!("unique    : {} (streaming merge)", unique);
-                eprintln!("output    : {}", out_name);
-                eprintln!("time      : {:.1}s", elapsed);
-                return Ok(());
+            if let Some(ref out_path) = cli.output {
+                let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?);
+                handle_spilled(&runs, &sm, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb, total_lines, start, cli.output.as_ref())?;
             } else {
-                let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
-                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
-                } else {
-                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
-                };
-                let unique = external_sort_spilled_runs(
-                    &runs,
-                    max_mem_bytes,
-                    cli.temp_dir.clone(),
-                    &mut out,
-                    &write_pb,
-                )?;
-                out.flush()?;
-                write_pb.finish_and_clear();
-
-                let elapsed = start.elapsed().as_secs_f32();
-                let out_name = cli.output.as_deref().unwrap_or(std::path::Path::new("stdout")).display();
-                eprintln!("mode      : {}", sort_mode);
-                eprintln!("lines in  : {}", total_lines);
-                eprintln!("unique    : {} (external sort)", unique);
-                eprintln!("output    : {}", out_name);
-                eprintln!("time      : {:.1}s", elapsed);
-                return Ok(());
+                let mut out = BufWriter::with_capacity(16 * 1024 * 1024, io::stdout());
+                handle_spilled(&runs, &sm, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb, total_lines, start, None)?;
             }
+            return Ok(());
         }
     };
 
@@ -1369,20 +1343,17 @@ fn main() -> Result<()> {
             records.par_sort_unstable();
             write_output_mmap(&records, cli.output.as_ref().unwrap(), &write_pb)?;
         } else {
-            let mut out: Box<dyn Write> = Box::new(BufWriter::with_capacity(
-                16 * 1024 * 1024,
-                File::create(cli.output.as_ref().unwrap())?,
-            ));
-            sort_and_write(records, max_mem_bytes, cli.temp_dir, &mut out, &write_pb)?;
+            let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(cli.output.as_ref().unwrap())?);
+            sort_and_write(records, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb)?;
             out.flush()?;
         }
+    } else if let Some(ref out_path) = cli.output {
+        let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?);
+        sort_and_write(records, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb)?;
+        out.flush()?;
     } else {
-        let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
-            Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
-        } else {
-            Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
-        };
-        sort_and_write(records, max_mem_bytes, cli.temp_dir, &mut out, &write_pb)?;
+        let mut out = BufWriter::with_capacity(16 * 1024 * 1024, io::stdout());
+        sort_and_write(records, max_mem_bytes, cli.temp_dir.clone(), &mut out, &write_pb)?;
         out.flush()?;
     }
     write_pb.finish_and_clear();
