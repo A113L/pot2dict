@@ -5,7 +5,7 @@ Fast, parallel tool for turning hashcat/john `.pot` files and plain wordlists in
 ## Features
 
 - Multithreaded counting (rayon) over mmap'd input, chunked at newline boundaries
-- Gzip (`.gz`) and Zstandard (`.zst`) input support
+- Gzip (`.gz`) and Zstandard (`.zst`) input support, decompressed and counted in parallel
 - `DashMap`-backed global counter — sharded, so many small input files scale without lock contention
 - Optional persistent bump-arena key allocation (`--arena`) for very large unique-password sets (~50M+)
 - Automatic spill-to-disk during counting when the working set exceeds your counting memory budget, with streaming external merge on read-back
@@ -13,6 +13,19 @@ Fast, parallel tool for turning hashcat/john `.pot` files and plain wordlists in
 - Optional mmap-based output writer (`--mmap-output`) for very large outputs (~10GB+)
 - Frequency-sorted or plain unique output
 - Optional parallel processing across input files (`--parallel-files`), auto-enabled above 100 inputs
+
+## Designed for low-RAM machines
+
+pot2dict is built to correctly process input sets much larger than available RAM — it is not just a fast in-memory hash-dedup tool. Every phase (counting, sorting, and merging) has a disk-spill fallback with bounded memory usage, controlled independently via `--count-mem` and `--max-mem`.
+
+This is a deliberate tradeoff. Tools that keep everything in memory (`awk '!seen[$0]++'`, most single-pass dedup utilities) are faster when your input's unique working set fits in RAM, but will swap or get OOM-killed when it doesn't. pot2dict is slower on those same well-fitting datasets, but stays memory-bounded and completes on hardware — e.g. an 8GB machine processing a 20GB+ low-duplication input — where memory-unbounded tools simply can't finish.
+
+**Practical implications:**
+
+- On memory-constrained machines, expect heavier disk spilling and correspondingly longer runtimes on large, low-duplication inputs. This is expected behavior, not a bug — it's the tradeoff that lets the run complete at all.
+- Spilling frequency scales with how tight your `--count-mem`/`--max-mem` budgets are relative to input size. If you have RAM to spare, raising these budgets (e.g. to 0.6–0.75 on an otherwise idle machine) produces fewer, larger spill runs and meaningfully less merge overhead — leave enough headroom for the OS and allocator (mimalloc), don't set these to consume all available RAM.
+- **Disk placement matters more than CPU on low-RAM runs.** Since spilling and merging are I/O-bound, put `--temp-dir` on a different physical disk than your input file if possible, and prefer SSD over HDD — this typically has a bigger impact on wall-clock time than thread count once you're spilling heavily.
+- `--arena` trades memory for speed by never freeing key allocations for the life of the run — avoid it on low-RAM machines with large or low-duplication inputs, since it works against the same memory constraints this tool is otherwise designed to respect.
 
 ## Install
 
@@ -58,7 +71,7 @@ pot2dict uses two separate, independently-tunable memory budgets:
 - **Counting budget** (`--count-mem`): caps the size of the in-memory frequency map while reading input. Once exceeded, the current counts are sorted and spilled to a temp file, and counting resumes from an empty map. If any spill occurs, the final result is produced by streaming/external-merging the spilled runs rather than sorting everything in RAM.
 - **Sort/output budget** (`--max-mem`): caps how much of the final (already-counted) record set can be sorted in memory before writing. Larger datasets are chunked, sorted per-chunk, spilled, and merged via a k-way heap merge.
 
-Both spill paths write to `--temp-dir` if given, otherwise the system temp directory.
+Both spill paths write to `--temp-dir` if given, otherwise the system temp directory. On low-RAM machines, these budgets — not CPU or thread count — are the primary lever for run time; see "Designed for low-RAM machines" above.
 
 ## License
 
