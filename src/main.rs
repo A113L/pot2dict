@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -21,38 +21,13 @@ use rustc_hash::FxHasher;
 use sysinfo::System;
 use tempfile::NamedTempFile;
 
-// hashbrown with FxHasher — lower memory overhead / faster hashing than std SipHash
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
-// Global counter is now a DashMap instead of Mutex<HashMap>. DashMap shards its
-// internal storage (16 shards by default, more with `shard-amount` feature), so
-// concurrent inserts/updates from many threads/files only contend on the shard
-// that owns a given key, not on a single global lock. This is the big win when
-// processing many (>100) small input files in parallel: with a single Mutex,
-// every file's fold-in serializes; with DashMap, folds from different files can
-// proceed concurrently as long as they touch different shards.
 pub type GlobalMap = DashMap<Vec<u8>, u64, FxBuildHasher>;
+const GLOBAL_MAP_SHARDS: usize = 1024;
 
-// ---------------------------------------------------------------------------
-// Persistent per-thread bump arenas (used only with --arena)
-// ---------------------------------------------------------------------------
-// When the password space is huge (tens of millions of uniques), the dominant
-// cost during counting is not hashing but heap allocation: every new key does
-// a malloc via `Vec<u8>`. A bump allocator turns that into a pointer bump.
-// We keep one `Bump` alive per rayon worker thread for the *entire* counting
-// phase (not per-chunk), and never call `Bump::reset`, so pointers we hand
-// out remain valid until the process exits. That lets local per-chunk maps
-// store `&'static [u8]` keys with zero copies, and the DashMap key type stays
-// `Vec<u8>` compatible via a thin wrapper that only allocates once, at first
-// insert into the global map (arena slice -> owned Vec<u8> happens exactly
-// once per *unique* password, not once per occurrence).
 struct ArenaPool {
     arenas: Vec<Bump>,
 }
-// Safety: each rayon worker thread only ever touches its own index (obtained
-// via `rayon::current_thread_index()`), so there is no concurrent mutable
-// access to the same `Bump`. We only hand out `&Bump` and Bump's own alloc
-// methods take `&self` (interior mutability), so this is sound.
 unsafe impl Sync for ArenaPool {}
 
 static ARENA_POOL: OnceLock<ArenaPool> = OnceLock::new();
@@ -64,25 +39,15 @@ fn arena_pool(num_threads: usize) -> &'static ArenaPool {
     })
 }
 
-/// Allocate `bytes` into this worker's persistent arena and return a
-/// `'static` slice. Only used in `--arena` mode.
 #[inline(always)]
 fn arena_alloc(pool: &'static ArenaPool, bytes: &[u8]) -> &'static [u8] {
     let idx = rayon::current_thread_index().unwrap_or(0) % pool.arenas.len();
     let bump = &pool.arenas[idx];
     let slice = bump.alloc_slice_copy(bytes);
     ARENA_ALLOCS.fetch_add(1, AtomicOrdering::Relaxed);
-    // Safety: the arena is never reset and lives for the process lifetime
-    // (leaked via `OnceLock`, never dropped), so extending the lifetime to
-    // 'static is sound as long as the program doesn't drop ARENA_POOL early
-    // (it never does — statics are dropped, if at all, only at process exit,
-    // and we don't rely on Drop running).
     unsafe { std::mem::transmute::<&[u8], &'static [u8]>(slice) }
 }
 
-// ---------------------------------------------------------------------------
-// Trim end — allocation-free
-// ---------------------------------------------------------------------------
 #[inline(always)]
 fn trim_end(mut line: &[u8]) -> &[u8] {
     while let Some(&b) = line.last() {
@@ -95,9 +60,6 @@ fn trim_end(mut line: &[u8]) -> &[u8] {
     line
 }
 
-// ---------------------------------------------------------------------------
-// Extract password — works for pot files and plain wordlists
-// ---------------------------------------------------------------------------
 #[inline(always)]
 fn extract_password(line: &[u8], keep_trailing_colon: bool) -> Option<&[u8]> {
     let line = trim_end(line);
@@ -117,18 +79,11 @@ fn extract_password(line: &[u8], keep_trailing_colon: bool) -> Option<&[u8]> {
     Some(line)
 }
 
-// ---------------------------------------------------------------------------
-// Bump counter using hashbrown's entry_ref — single hash, no double lookup,
-// and no allocation on the "key already present" path (entry_ref only needs
-// `&[u8]` to probe; `Vec<u8>` is only materialized on first insert).
-// ---------------------------------------------------------------------------
 #[inline(always)]
 fn bump_count(map: &mut FastMap<Vec<u8>, u64>, pw: &[u8]) {
     *map.entry_ref(pw).or_insert(0) += 1;
 }
 
-/// Same as `bump_count` but the owned key (on first insert) is allocated from
-/// a persistent per-thread bump arena instead of the global heap allocator.
 #[inline(always)]
 fn bump_count_arena(map: &mut FastMap<&'static [u8], u64>, pool: &'static ArenaPool, pw: &[u8]) {
     match map.raw_entry_mut().from_key(pw) {
@@ -142,13 +97,9 @@ fn bump_count_arena(map: &mut FastMap<&'static [u8], u64>, pool: &'static ArenaP
     }
 }
 
-// ---------------------------------------------------------------------------
-// Count passwords in a chunk — returns local FastMap
-// ---------------------------------------------------------------------------
 fn count_chunk(chunk: &[u8], keep_trailing_colon: bool) -> FastMap<Vec<u8>, u64> {
     let mut map = FastMap::default();
     map.reserve(chunk.len() / 12 + 16);
-
     let mut start = 0usize;
     while let Some(end) = memchr::memchr(b'\n', &chunk[start..]) {
         let line = &chunk[start..start + end];
@@ -172,7 +123,6 @@ fn count_chunk_arena(
 ) -> FastMap<&'static [u8], u64> {
     let mut map: FastMap<&'static [u8], u64> = FastMap::default();
     map.reserve(chunk.len() / 12 + 16);
-
     let mut start = 0usize;
     while let Some(end) = memchr::memchr(b'\n', &chunk[start..]) {
         let line = &chunk[start..start + end];
@@ -189,59 +139,465 @@ fn count_chunk_arena(
     map
 }
 
-// ---------------------------------------------------------------------------
-// Merge two count maps — fold smaller into larger (owned-key variant)
-// ---------------------------------------------------------------------------
-fn merge_maps(mut a: FastMap<Vec<u8>, u64>, b: FastMap<Vec<u8>, u64>) -> FastMap<Vec<u8>, u64> {
-    if a.len() < b.len() {
-        return merge_maps(b, a);
-    }
-    a.reserve(b.len());
-    for (k, v) in b {
-        *a.entry(k).or_insert(0) += v;
-    }
-    a
+const PER_ENTRY_OVERHEAD_BYTES: usize = 48;
+
+pub enum FinalizedResult {
+    InMemory(u64, Vec<Record>),
+    Spilled {
+        runs: Vec<tempfile::TempPath>,
+        sort_mode: String,
+    },
 }
 
-fn merge_maps_arena(
-    mut a: FastMap<&'static [u8], u64>,
-    b: FastMap<&'static [u8], u64>,
-) -> FastMap<&'static [u8], u64> {
-    if a.len() < b.len() {
-        return merge_maps_arena(b, a);
-    }
-    a.reserve(b.len());
-    for (k, v) in b {
-        *a.entry(k).or_insert(0) += v;
-    }
-    a
+pub struct CountingIndex {
+    map: GlobalMap,
+    approx_bytes: AtomicUsize,
+    budget_bytes: usize,
+    temp_dir: Option<PathBuf>,
+    spilled_runs: Mutex<Vec<tempfile::TempPath>>,
+    spill_lock: RwLock<()>,
 }
 
-// ---------------------------------------------------------------------------
-// Fold a local map into the global DashMap — no single global lock; only the
-// shard(s) touched by these keys are briefly locked.
-// ---------------------------------------------------------------------------
-fn fold_into_dashmap(global: &GlobalMap, local: FastMap<Vec<u8>, u64>) {
+impl CountingIndex {
+    fn new(budget_bytes: usize, temp_dir: Option<PathBuf>) -> Self {
+        CountingIndex {
+            map: DashMap::with_capacity_and_hasher_and_shard_amount(
+                1 << 20,
+                FxBuildHasher,
+                GLOBAL_MAP_SHARDS,
+            ),
+            approx_bytes: AtomicUsize::new(0),
+            budget_bytes,
+            temp_dir,
+            spilled_runs: Mutex::new(Vec::new()),
+            spill_lock: RwLock::new(()),
+        }
+    }
+
+    fn maybe_spill(&self) -> Result<()> {
+        if self.approx_bytes.load(AtomicOrdering::Relaxed) < self.budget_bytes {
+            return Ok(());
+        }
+        let _guard = self.spill_lock.write().unwrap();
+        if self.approx_bytes.load(AtomicOrdering::Relaxed) < self.budget_bytes {
+            return Ok(());
+        }
+        if self.map.is_empty() {
+            return Ok(());
+        }
+        let approx_gb =
+            self.approx_bytes.load(AtomicOrdering::Relaxed) as f64 / (1024.0 * 1024.0 * 1024.0);
+        let run_num = {
+            let runs = self.spilled_runs.lock().unwrap();
+            runs.len() + 1
+        };
+        eprintln!(
+            "Counting working set (~{:.2} GB) exceeds memory budget; spilling to disk (run #{}).",
+            approx_gb, run_num
+        );
+
+        let mut entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(self.map.len());
+        for entry in self.map.iter() {
+            entries.push((entry.key().clone(), *entry.value()));
+        }
+        self.map.clear();
+        self.approx_bytes.store(0, AtomicOrdering::Relaxed);
+
+        entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let temp = if let Some(ref dir) = self.temp_dir {
+            NamedTempFile::new_in(dir)?
+        } else {
+            NamedTempFile::new()?
+        };
+        {
+            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
+            for (pw, count) in &entries {
+                write_record(
+                    &mut writer,
+                    &Record {
+                        key: *count as i64,
+                        pw: pw.clone(),
+                    },
+                )?;
+            }
+            writer.flush()?;
+        }
+        self.spilled_runs.lock().unwrap().push(temp.into_temp_path());
+        Ok(())
+    }
+
+    fn has_spilled(&self) -> bool {
+        !self.spilled_runs.lock().unwrap().is_empty()
+    }
+
+    fn finalize(self, sort_mode: &str) -> Result<FinalizedResult> {
+        let mut spilled_runs = match self.spilled_runs.into_inner() {
+            Ok(runs) => runs,
+            Err(poisoned) => {
+                eprintln!("Warning: spilled_runs mutex was poisoned, recovering partial data.");
+                poisoned.into_inner()
+            }
+        };
+
+        if spilled_runs.is_empty() {
+            let unique = self.map.len() as u64;
+            let records = if sort_mode == "frequency" {
+                self.map
+                    .into_iter()
+                    .map(|(pw, freq)| Record {
+                        key: -(freq as i64),
+                        pw,
+                    })
+                    .collect()
+            } else {
+                self.map
+                    .into_iter()
+                    .map(|(pw, _freq)| Record { key: 0, pw })
+                    .collect()
+            };
+            return Ok(FinalizedResult::InMemory(unique, records));
+        }
+
+        if !self.map.is_empty() {
+            let mut entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(self.map.len());
+            for entry in self.map.iter() {
+                entries.push((entry.key().clone(), *entry.value()));
+            }
+            entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let temp = if let Some(ref dir) = self.temp_dir {
+                NamedTempFile::new_in(dir)?
+            } else {
+                NamedTempFile::new()?
+            };
+            {
+                let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
+                for (pw, count) in &entries {
+                    write_record(
+                        &mut writer,
+                        &Record {
+                            key: *count as i64,
+                            pw: pw.clone(),
+                        },
+                    )?;
+                }
+                writer.flush()?;
+            }
+            spilled_runs.push(temp.into_temp_path());
+        }
+
+        eprintln!(
+            "Merging {} spilled counting runs from disk...",
+            spilled_runs.len()
+        );
+        Ok(FinalizedResult::Spilled {
+            runs: spilled_runs,
+            sort_mode: sort_mode.to_string(),
+        })
+    }
+}
+
+fn fold_into_dashmap(index: &CountingIndex, local: FastMap<Vec<u8>, u64>) {
+    let _guard = index.spill_lock.read().unwrap();
     for (k, v) in local {
-        *global.entry(k).or_insert(0) += v;
+        match index.map.entry(k) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                *e.get_mut() += v;
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                index
+                    .approx_bytes
+                    .fetch_add(e.key().len() + PER_ENTRY_OVERHEAD_BYTES, AtomicOrdering::Relaxed);
+                e.insert(v);
+            }
+        }
     }
 }
 
-fn fold_into_dashmap_arena(global: &GlobalMap, local: FastMap<&'static [u8], u64>) {
+fn fold_into_dashmap_arena(index: &CountingIndex, local: FastMap<&'static [u8], u64>) {
+    let _guard = index.spill_lock.read().unwrap();
     for (k, v) in local {
-        // First time this password is seen globally, pay one heap allocation
-        // to give the DashMap an owned `Vec<u8>`. Every other occurrence
-        // across every chunk/file was counted using the arena slice, at
-        // arena-allocation (not malloc) cost. DashMap has no `entry_ref`,
-        // so the copy to `Vec<u8>` happens unconditionally here, but it's
-        // still only once per *unique* password rather than once per line.
-        *global.entry(k.to_vec()).or_insert(0) += v;
+        match index.map.entry(k.to_vec()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                *e.get_mut() += v;
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                index
+                    .approx_bytes
+                    .fetch_add(e.key().len() + PER_ENTRY_OVERHEAD_BYTES, AtomicOrdering::Relaxed);
+                e.insert(v);
+            }
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Split mmap into chunks at newline boundaries
-// ---------------------------------------------------------------------------
+fn stream_merge_and_write(
+    runs: &[tempfile::TempPath],
+    out: &mut impl Write,
+    progress: &ProgressBar,
+) -> Result<u64> {
+    struct HeapEntry {
+        pw: Vec<u8>,
+        count: u64,
+        idx: usize,
+    }
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.pw == other.pw
+        }
+    }
+    impl Eq for HeapEntry {}
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other.pw.cmp(&self.pw)
+        }
+    }
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut readers: Vec<BufReader<File>> = runs
+        .iter()
+        .map(|p| -> Result<BufReader<File>> {
+            Ok(BufReader::with_capacity(4 * 1024 * 1024, File::open(p)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(readers.len());
+    for (idx, r) in readers.iter_mut().enumerate() {
+        if let Some(rec) = read_record(r)? {
+            heap.push(HeapEntry {
+                pw: rec.pw,
+                count: rec.key as u64,
+                idx,
+            });
+        }
+    }
+
+    let mut unique: u64 = 0;
+    while let Some(HeapEntry { pw, count, idx }) = heap.pop() {
+        let mut _total = count;
+        if let Some(next) = read_record(&mut readers[idx])? {
+            heap.push(HeapEntry {
+                pw: next.pw,
+                count: next.key as u64,
+                idx,
+            });
+        }
+        while let Some(top) = heap.peek() {
+            if top.pw != pw {
+                break;
+            }
+            let HeapEntry {
+                count: c2,
+                idx: idx2,
+                ..
+            } = heap.pop().unwrap();
+            _total += c2;
+            if let Some(next2) = read_record(&mut readers[idx2])? {
+                heap.push(HeapEntry {
+                    pw: next2.pw,
+                    count: next2.key as u64,
+                    idx: idx2,
+                });
+            }
+        }
+        out.write_all(&pw)?;
+        out.write_all(b"\n")?;
+        progress.inc(1);
+        unique += 1;
+    }
+    Ok(unique)
+}
+
+fn external_sort_spilled_runs(
+    runs: &[tempfile::TempPath],
+    max_mem_bytes: usize,
+    temp_dir: Option<PathBuf>,
+    out: &mut impl Write,
+    progress: &ProgressBar,
+) -> Result<u64> {
+    struct CountHeapEntry {
+        pw: Vec<u8>,
+        count: u64,
+        idx: usize,
+    }
+    impl PartialEq for CountHeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.pw == other.pw
+        }
+    }
+    impl Eq for CountHeapEntry {}
+    impl Ord for CountHeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other.pw.cmp(&self.pw)
+        }
+    }
+    impl PartialOrd for CountHeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let merged = if let Some(ref dir) = temp_dir {
+        NamedTempFile::new_in(dir)?
+    } else {
+        NamedTempFile::new()?
+    };
+    {
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &merged);
+        let mut readers: Vec<BufReader<File>> = runs
+            .iter()
+            .map(|p| -> Result<BufReader<File>> {
+                Ok(BufReader::with_capacity(4 * 1024 * 1024, File::open(p)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut heap = std::collections::BinaryHeap::with_capacity(readers.len());
+        for (idx, r) in readers.iter_mut().enumerate() {
+            if let Some(rec) = read_record(r)? {
+                heap.push(CountHeapEntry {
+                    pw: rec.pw,
+                    count: rec.key as u64,
+                    idx,
+                });
+            }
+        }
+
+        while let Some(CountHeapEntry { pw, count, idx }) = heap.pop() {
+            let mut total = count;
+            if let Some(next) = read_record(&mut readers[idx])? {
+                heap.push(CountHeapEntry {
+                    pw: next.pw,
+                    count: next.key as u64,
+                    idx,
+                });
+            }
+            while let Some(top) = heap.peek() {
+                if top.pw != pw {
+                    break;
+                }
+                let CountHeapEntry {
+                    count: c2,
+                    idx: idx2,
+                    ..
+                } = heap.pop().unwrap();
+                total += c2;
+                if let Some(next2) = read_record(&mut readers[idx2])? {
+                    heap.push(CountHeapEntry {
+                        pw: next2.pw,
+                        count: next2.key as u64,
+                        idx: idx2,
+                    });
+                }
+            }
+            write_record(
+                &mut writer,
+                &Record {
+                    key: -(total as i64),
+                    pw,
+                },
+            )?;
+        }
+        writer.flush()?;
+    }
+    let merged_path = merged.into_temp_path();
+
+    let avg_record_size = {
+        let mut r = BufReader::with_capacity(4 * 1024 * 1024, File::open(&merged_path)?);
+        if let Some(first) = read_record(&mut r)? {
+            (first.pw.len() + 24).max(1)
+        } else {
+            32
+        }
+    };
+
+    let chunk_len = std::cmp::max(1, max_mem_bytes / avg_record_size.max(1));
+
+    let mut temp_files: Vec<tempfile::TempPath> = Vec::new();
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, File::open(&merged_path)?);
+
+    loop {
+        let mut chunk: Vec<Record> = Vec::with_capacity(chunk_len);
+        let mut chunk_bytes = 0usize;
+        while chunk.len() < chunk_len && chunk_bytes < max_mem_bytes {
+            match read_record(&mut reader)? {
+                Some(rec) => {
+                    chunk_bytes += rec.pw.len() + 24;
+                    chunk.push(rec);
+                }
+                None => break,
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        chunk.par_sort_unstable();
+
+        let temp = if let Some(ref dir) = temp_dir {
+            NamedTempFile::new_in(dir)?
+        } else {
+            NamedTempFile::new()?
+        };
+        {
+            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
+            for r in &chunk {
+                write_record(&mut writer, r)?;
+            }
+            writer.flush()?;
+        }
+        temp_files.push(temp.into_temp_path());
+    }
+
+    struct HeapEntry {
+        rec: Record,
+        idx: usize,
+    }
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.rec == other.rec
+        }
+    }
+    impl Eq for HeapEntry {}
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other.rec.cmp(&self.rec)
+        }
+    }
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut readers: Vec<BufReader<File>> = temp_files
+        .iter()
+        .map(|p| BufReader::with_capacity(2 * 1024 * 1024, File::open(p).unwrap()))
+        .collect();
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(readers.len());
+    for (idx, r) in readers.iter_mut().enumerate() {
+        if let Some(rec) = read_record(r)? {
+            heap.push(HeapEntry { rec, idx });
+        }
+    }
+
+    let mut out_writer = BufWriter::with_capacity(16 * 1024 * 1024, &mut *out);
+    let mut unique: u64 = 0;
+    while let Some(HeapEntry { rec, idx }) = heap.pop() {
+        out_writer.write_all(&rec.pw)?;
+        out_writer.write_all(b"\n")?;
+        progress.inc(1);
+        unique += 1;
+        if let Some(next) = read_record(&mut readers[idx])? {
+            heap.push(HeapEntry { rec: next, idx });
+        }
+    }
+    out_writer.flush()?;
+    Ok(unique)
+}
+
 fn split_into_chunks(data: &[u8], target_chunk_size: usize) -> Vec<&[u8]> {
     let total_len = data.len();
     if target_chunk_size >= total_len {
@@ -268,9 +624,6 @@ fn split_into_chunks(data: &[u8], target_chunk_size: usize) -> Vec<&[u8]> {
     chunks
 }
 
-// ---------------------------------------------------------------------------
-// Compressed-stream reading: gzip (.gz) and zstd (.zst)
-// ---------------------------------------------------------------------------
 enum CompressedKind {
     Gzip,
     Zstd,
@@ -288,44 +641,38 @@ fn open_compressed_reader(path: &PathBuf, kind: &CompressedKind) -> Result<Box<d
     let file = File::open(path)?;
     Ok(match kind {
         CompressedKind::Gzip => {
-            Box::new(BufReader::with_capacity(16 * 1024 * 1024, MultiGzDecoder::new(file)))
+            Box::new(BufReader::with_capacity(64 * 1024, MultiGzDecoder::new(file)))
         }
         CompressedKind::Zstd => {
-            // zstd decoder handles its own internal buffering, but we still
-            // wrap it so `read_until` doesn't do a syscall-sized read per
-            // call. zstd typically decompresses 3-5x faster than gzip at
-            // comparable compression ratios, so this path is worth adding
-            // whenever you control the input format (re-encode wordlists as
-            // .zst instead of .gz).
             let decoder = zstd::stream::read::Decoder::new(file)?;
-            Box::new(BufReader::with_capacity(16 * 1024 * 1024, decoder))
+            Box::new(BufReader::with_capacity(64 * 1024, decoder))
         }
     })
 }
 
-// ---------------------------------------------------------------------------
-// Read a single (possibly compressed) file, folding counts into `global`.
-// ---------------------------------------------------------------------------
 fn read_file(
     path: &PathBuf,
     pb: &ProgressBar,
-    global: &GlobalMap,
+    index: &CountingIndex,
     keep_trailing_colon: bool,
     use_arena: bool,
+    chunk_batch_size: Option<usize>,
 ) -> Result<u64> {
     let file = File::open(path)?;
     let file_size = file.metadata()?.len() as usize;
 
+    const SPILL_CHECK_LINES: u64 = 2_000_000;
+
     if let Some(kind) = compressed_kind(path) {
-        drop(file); // reopened inside open_compressed_reader
+        drop(file);
         let mut reader = open_compressed_reader(path, &kind)?;
         let mut bytes_read: u64 = 0;
         let mut last_reported: u64 = 0;
+        let mut lines_since_check: u64 = 0;
         let mut local: FastMap<Vec<u8>, u64> = FastMap::default();
         let mut line_buf: Vec<u8> = Vec::with_capacity(256);
         let mut total_lines: u64 = 0;
         let mut line_count: u64 = 0;
-        // read_until needs BufRead; wrap the trait object.
         let mut reader = BufReader::with_capacity(1 << 20, &mut *reader);
 
         loop {
@@ -337,10 +684,8 @@ fn read_file(
             bytes_read += n as u64;
             total_lines += 1;
             line_count += 1;
+            lines_since_check += 1;
             if line_count >= 16384 {
-                // inc() adds a delta on top of the bar's current (cumulative,
-                // across all files) position — unlike set_position(), it
-                // never resets progress made by files processed earlier.
                 pb.inc(bytes_read - last_reported);
                 last_reported = bytes_read;
                 line_count = 0;
@@ -348,9 +693,15 @@ fn read_file(
             if let Some(pw) = extract_password(&line_buf, keep_trailing_colon) {
                 bump_count(&mut local, pw);
             }
+            if lines_since_check >= SPILL_CHECK_LINES {
+                fold_into_dashmap(index, std::mem::take(&mut local));
+                index.maybe_spill()?;
+                lines_since_check = 0;
+            }
         }
         pb.inc(bytes_read - last_reported);
-        fold_into_dashmap(global, local);
+        fold_into_dashmap(index, local);
+        index.maybe_spill()?;
         Ok(total_lines)
     } else {
         eprintln!("Processing {} ({} bytes)...", path.display(), file_size);
@@ -367,35 +718,57 @@ fn read_file(
         let chunks_done = AtomicU64::new(0);
         let lines_done = AtomicU64::new(0);
 
-        if use_arena {
-            let pool = arena_pool(rayon::current_num_threads());
-            let merged = chunks
-                .par_iter()
-                .map(|chunk| {
-                    let m = count_chunk_arena(chunk, keep_trailing_colon, pool);
-                    let lines: u64 = m.values().sum();
-                    lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
-                    let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                    pb.inc(chunk.len() as u64);
-                    pb.set_message(format!("{} / {} chunks done", done, total_chunks));
-                    m
-                })
-                .reduce(FastMap::default, merge_maps_arena);
-            fold_into_dashmap_arena(global, merged);
-        } else {
-            let merged = chunks
-                .par_iter()
-                .map(|chunk| {
-                    let m = count_chunk(chunk, keep_trailing_colon);
-                    let lines: u64 = m.values().sum();
-                    lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
-                    let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                    pb.inc(chunk.len() as u64);
-                    pb.set_message(format!("{} / {} chunks done", done, total_chunks));
-                    m
-                })
-                .reduce(FastMap::default, merge_maps);
-            fold_into_dashmap(global, merged);
+        let batch_size: usize =
+            chunk_batch_size.unwrap_or_else(|| rayon::current_num_threads()).max(1);
+
+        for batch in chunks.chunks(batch_size) {
+            if use_arena {
+                let pool = arena_pool(rayon::current_num_threads());
+                batch
+                    .par_iter()
+                    .fold(
+                        || FastMap::<&'static [u8], u64>::default(),
+                        |mut acc, chunk| {
+                            let m = count_chunk_arena(chunk, keep_trailing_colon, pool);
+                            let lines: u64 = m.values().sum();
+                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
+                            let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                            pb.inc(chunk.len() as u64);
+                            if done % 16 == 0 || done == total_chunks as u64 {
+                                pb.set_message(format!("{} / {} chunks done", done, total_chunks));
+                            }
+                            acc.reserve(m.len());
+                            for (k, v) in m {
+                                *acc.entry(k).or_insert(0) += v;
+                            }
+                            acc
+                        },
+                    )
+                    .for_each(|local| fold_into_dashmap_arena(index, local));
+            } else {
+                batch
+                    .par_iter()
+                    .fold(
+                        || FastMap::<Vec<u8>, u64>::default(),
+                        |mut acc, chunk| {
+                            let m = count_chunk(chunk, keep_trailing_colon);
+                            let lines: u64 = m.values().sum();
+                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
+                            let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                            pb.inc(chunk.len() as u64);
+                            if done % 16 == 0 || done == total_chunks as u64 {
+                                pb.set_message(format!("{} / {} chunks done", done, total_chunks));
+                            }
+                            acc.reserve(m.len());
+                            for (k, v) in m {
+                                *acc.entry(k).or_insert(0) += v;
+                            }
+                            acc
+                        },
+                    )
+                    .for_each(|local| fold_into_dashmap(index, local));
+            }
+            index.maybe_spill()?;
         }
 
         let total_lines = lines_done.load(AtomicOrdering::Relaxed);
@@ -404,11 +777,8 @@ fn read_file(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sort record — precomputed key for O(1) comparisons
-// ---------------------------------------------------------------------------
 #[derive(Clone)]
-struct Record {
+pub struct Record {
     key: i64,
     pw: Vec<u8>,
 }
@@ -455,27 +825,10 @@ fn read_record(r: &mut impl Read) -> io::Result<Option<Record>> {
     Ok(Some(Record { key, pw }))
 }
 
-// ---------------------------------------------------------------------------
-// mmap-based output writer
-// ---------------------------------------------------------------------------
-// Instead of streaming through a BufWriter (kernel copies user buffer -> page
-// cache on every write syscall), we mmap the destination file MAP_SHARED,
-// pre-compute each record's byte offset (prefix sum over `len(pw) + 1`), then
-// write all records in parallel directly into the mapping. The kernel handles
-// dirty-page writeback asynchronously, with a final `flush()` to guarantee
-// durability. This mainly helps once output size is large enough (>10 GB)
-// that syscall/copy overhead of buffered writes becomes a real cost.
 struct SyncMmapMut(*mut u8, usize);
-// Safety: each thread writes to a disjoint byte range of the mapping
-// (offsets are precomputed and non-overlapping), so concurrent access is
-// data-race free even though `MmapMut` isn't `Sync` by default.
 unsafe impl Sync for SyncMmapMut {}
 unsafe impl Send for SyncMmapMut {}
 impl SyncMmapMut {
-    // Accessed via a method (not `base.0` directly) so that Rust 2021's
-    // disjoint closure captures grab a reference to the whole `SyncMmapMut`
-    // struct rather than to the bare `*mut u8` field — the latter would
-    // capture `&*mut u8`, which isn't `Sync`, and bypass our unsafe impl.
     #[inline(always)]
     fn ptr(&self) -> *mut u8 {
         self.0
@@ -491,7 +844,7 @@ fn write_output_mmap(records: &[Record], out_path: &PathBuf, progress: &Progress
     let mut acc = 0usize;
     offsets.push(0);
     for r in records {
-        acc += r.pw.len() + 1; // password + '\n'
+        acc += r.pw.len() + 1;
         offsets.push(acc);
     }
     let total_size = acc as u64;
@@ -519,12 +872,10 @@ fn write_output_mmap(records: &[Record], out_path: &PathBuf, progress: &Progress
         });
 
     mmap.flush()?;
+    file.sync_all()?;
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Sort records and write — in-memory or external merge sort
-// ---------------------------------------------------------------------------
 fn sort_and_write(
     mut records: Vec<Record>,
     max_mem_bytes: usize,
@@ -579,8 +930,6 @@ fn sort_and_write(
     }
     drop(records);
 
-    use std::collections::BinaryHeap;
-
     struct HeapEntry {
         rec: Record,
         idx: usize,
@@ -607,7 +956,7 @@ fn sort_and_write(
         .map(|p| BufReader::with_capacity(2 * 1024 * 1024, File::open(p).unwrap()))
         .collect();
 
-    let mut heap = BinaryHeap::with_capacity(readers.len());
+    let mut heap = std::collections::BinaryHeap::with_capacity(readers.len());
     for (idx, r) in readers.iter_mut().enumerate() {
         if let Some(rec) = read_record(r)? {
             heap.push(HeapEntry { rec, idx });
@@ -629,9 +978,6 @@ fn sort_and_write(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Interactive choice
-// ---------------------------------------------------------------------------
 fn interactive_choice() -> bool {
     print!("Sort by frequency? (y/n): ");
     io::stdout().flush().unwrap();
@@ -640,9 +986,6 @@ fn interactive_choice() -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes" | "true" | "1")
 }
 
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
 #[derive(Parser)]
 #[command(
     author,
@@ -662,6 +1005,12 @@ struct Cli {
     #[arg(long, default_value_t = 0.5)]
     max_mem: f64,
 
+    #[arg(long, default_value_t = 0.3)]
+    count_mem: f64,
+
+    #[arg(long)]
+    chunk_batch_size: Option<usize>,
+
     #[arg(long)]
     temp_dir: Option<PathBuf>,
 
@@ -674,31 +1023,16 @@ struct Cli {
     #[arg(long)]
     keep_trailing_colon: bool,
 
-    /// Use a persistent per-thread bump arena for key allocation during
-    /// counting instead of the global heap allocator. Worth enabling once
-    /// the unique-password count is expected to exceed ~50M — below that
-    /// the allocator overhead this avoids is not the bottleneck.
-    /// Note: arena memory is never freed until the process exits.
     #[arg(long)]
     arena: bool,
 
-    /// Write the final sorted output via a memory-mapped file instead of a
-    /// buffered writer. Worth enabling once the output is expected to
-    /// exceed ~10 GB; below that, buffered I/O is simpler and just as fast.
     #[arg(long)]
     mmap_output: bool,
 
-    /// Process input files in parallel across files (in addition to the
-    /// existing intra-file chunk parallelism). Worth enabling with >100
-    /// input files, where DashMap's sharding avoids the contention a single
-    /// Mutex<HashMap> would create.
     #[arg(long)]
     parallel_files: bool,
 }
 
-// ---------------------------------------------------------------------------
-// MAIN
-// ---------------------------------------------------------------------------
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -725,7 +1059,8 @@ fn main() -> Result<()> {
     };
     eprintln!("Sort mode: {}", sort_mode);
     if cli.arena {
-        eprintln!("Arena allocator: ON (persistent per-thread bump arenas)");
+        eprintln!("WARNING: Arena allocator is ON. Arenas grow forever and are never freed.");
+        eprintln!("         Do not use --arena for large files or you will OOM.");
     }
 
     let start = Instant::now();
@@ -739,7 +1074,13 @@ fn main() -> Result<()> {
         .progress_chars("#>-"),
     );
 
-    let global: GlobalMap = DashMap::with_hasher(FxBuildHasher);
+    let count_budget_bytes = (total_ram as f64 * cli.count_mem).max(256.0 * 1024.0 * 1024.0) as usize;
+    eprintln!(
+        "Counting memory budget: {:.2} GB (spills to disk beyond this).",
+        count_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
+    let index = CountingIndex::new(count_budget_bytes, cli.temp_dir.clone());
     let total_lines_acc = AtomicU64::new(0);
     let total_bytes: u64 = cli
         .inputs
@@ -751,66 +1092,41 @@ fn main() -> Result<()> {
 
     let auto_parallel_files = cli.parallel_files || cli.inputs.len() > 100;
 
-    if auto_parallel_files {
+    let pb = if auto_parallel_files {
         eprintln!(
-            "{} input files: processing files in parallel (DashMap sharding avoids single-lock contention).",
+            "{} input files: processing files in parallel.",
             cli.inputs.len()
         );
+        let pb_arc = Arc::new(pb);
         cli.inputs.par_iter().try_for_each(|path| -> Result<()> {
-            let lines_read = read_file(path, &pb, &global, cli.keep_trailing_colon, cli.arena)?;
+            let lines_read = read_file(path, &pb_arc, &index, cli.keep_trailing_colon, cli.arena, cli.chunk_batch_size)?;
             total_lines_acc.fetch_add(lines_read, AtomicOrdering::Relaxed);
             Ok(())
         })?;
+        Arc::try_unwrap(pb_arc).unwrap_or_else(|pb_arc| (*pb_arc).clone())
     } else {
         for path in &cli.inputs {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             pb.set_message(name.to_string());
-            let lines_read = read_file(path, &pb, &global, cli.keep_trailing_colon, cli.arena)?;
+            let lines_read = read_file(path, &pb, &index, cli.keep_trailing_colon, cli.arena, cli.chunk_batch_size)?;
             total_lines_acc.fetch_add(lines_read, AtomicOrdering::Relaxed);
         }
-    }
+        pb
+    };
     pb.finish_and_clear();
 
     let total_lines = total_lines_acc.load(AtomicOrdering::Relaxed);
-    let unique_passwords = global.len();
-    eprintln!("Found {} unique passwords.", unique_passwords);
     if cli.arena {
         eprintln!(
             "Arena allocations (unique-key inserts across all chunks): {}",
             ARENA_ALLOCS.load(AtomicOrdering::Relaxed)
         );
     }
-
-    if unique_passwords == 0 {
-        eprintln!("No data.");
-        return Ok(());
+    if index.has_spilled() {
+        eprintln!("Counting phase spilled to disk at least once; merging runs now.");
     }
 
-    eprintln!(
-        "{}...",
-        if sort_mode == "frequency" {
-            "Sorting by frequency"
-        } else {
-            "Sorting alphabetically"
-        }
-    );
-
-    let records: Vec<Record> = if sort_mode == "frequency" {
-        global
-            .into_iter()
-            .map(|(pw, freq)| Record {
-                key: -(freq as i64),
-                pw,
-            })
-            .collect()
-    } else {
-        global
-            .into_iter()
-            .map(|(pw, _freq)| Record { key: 0, pw })
-            .collect()
-    };
-
-    let write_pb = ProgressBar::new(unique_passwords as u64);
+    let write_pb = ProgressBar::new(0);
     write_pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta})  writing...",
@@ -819,20 +1135,71 @@ fn main() -> Result<()> {
         .progress_chars("#>-"),
     );
 
-    let estimated_output_size: u64 = records.iter().map(|r| (r.pw.len() + 1) as u64).sum();
-    const MMAP_OUTPUT_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
+    let (unique_passwords, records) = match index.finalize(sort_mode)? {
+        FinalizedResult::InMemory(u, r) => (u as usize, Some(r)),
+        FinalizedResult::Spilled { runs, sort_mode: sm } => {
+            if sm == "unique" {
+                let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
+                } else {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
+                };
+                let unique = stream_merge_and_write(&runs, &mut out, &write_pb)?;
+                out.flush()?;
+                write_pb.finish_and_clear();
 
-    if cli.output.is_some()
-        && (cli.mmap_output || estimated_output_size > MMAP_OUTPUT_THRESHOLD)
-        && sort_mode != "unique_external_spill_placeholder"
-    {
-        // mmap output path only makes sense once we have the fully sorted,
-        // in-memory record set with known final size — so first sort, then
-        // write via mmap instead of the generic sort_and_write() streaming
-        // writer. If the dataset is so large it needs the external
-        // merge-sort spill path, fall back to the normal streaming writer
-        // (mixing mmap-output with the disk-spill merge writer is not
-        // implemented here).
+                let elapsed = start.elapsed().as_secs_f32();
+                let out_name = cli.output.as_deref().unwrap_or(std::path::Path::new("stdout")).display();
+                eprintln!("mode      : {}", sort_mode);
+                eprintln!("lines in  : {}", total_lines);
+                eprintln!("unique    : {} (streaming merge)", unique);
+                eprintln!("output    : {}", out_name);
+                eprintln!("time      : {:.1}s", elapsed);
+                return Ok(());
+            } else {
+                let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
+                } else {
+                    Box::new(BufWriter::with_capacity(16 * 1024 * 1024, io::stdout()))
+                };
+                let unique = external_sort_spilled_runs(
+                    &runs,
+                    max_mem_bytes,
+                    cli.temp_dir.clone(),
+                    &mut out,
+                    &write_pb,
+                )?;
+                out.flush()?;
+                write_pb.finish_and_clear();
+
+                let elapsed = start.elapsed().as_secs_f32();
+                let out_name = cli.output.as_deref().unwrap_or(std::path::Path::new("stdout")).display();
+                eprintln!("mode      : {}", sort_mode);
+                eprintln!("lines in  : {}", total_lines);
+                eprintln!("unique    : {} (external sort)", unique);
+                eprintln!("output    : {}", out_name);
+                eprintln!("time      : {:.1}s", elapsed);
+                return Ok(());
+            }
+        }
+    };
+
+    eprintln!("Found {} unique passwords.", unique_passwords);
+
+    if unique_passwords == 0 {
+        eprintln!("No data.");
+        return Ok(());
+    }
+
+    let records = records.unwrap();
+    let estimated_output_size: u64 = records.iter().map(|r| (r.pw.len() + 1) as u64).sum();
+    const MMAP_OUTPUT_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024;
+
+    let use_mmap = cli.mmap_output
+        && estimated_output_size > MMAP_OUTPUT_THRESHOLD
+        && records.len() < 100_000_000;
+
+    if cli.output.is_some() && use_mmap {
         let estimated_mem: usize = records.iter().map(|r| r.pw.len() + 40).sum();
         if estimated_mem <= max_mem_bytes {
             eprintln!(
