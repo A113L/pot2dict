@@ -345,10 +345,11 @@ impl CountingIndex {
             approx_gb
         ));
 
-        // Sequential collection since DashMap rayon feature may not be enabled
+        // dashmap's "rayon" feature (enabled in Cargo.toml) gives us
+        // par_iter(), so collect this in parallel instead of on one thread.
         let entries: Vec<(Vec<u8>, u64)> = self
             .map
-            .iter()
+            .par_iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
             .collect();
         self.map.clear();
@@ -409,7 +410,7 @@ impl CountingIndex {
 
             let mut entries: Vec<(Vec<u8>, u64)> = self
                 .map
-                .iter()
+                .par_iter()
                 .map(|entry| (entry.key().clone(), *entry.value()))
                 .collect();
             entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1031,6 +1032,36 @@ fn write_record(w: &mut impl Write, r: &Record) -> io::Result<()> {
 }
 
 #[inline(always)]
+/// Counts the total number of records across a set of spilled run files
+/// without reading the password bytes themselves — only the fixed 12-byte
+/// header per record is read, and the payload is skipped via seek. This is
+/// an UPPER BOUND on the final unique-password count (since the merge phase
+/// still dedups across runs), but it's cheap to compute and gives the merge
+/// progress bar a real length instead of 0, so ETA is meaningful instead of
+/// always showing "0s".
+fn count_records_in_runs(runs: &[tempfile::TempPath]) -> Result<u64> {
+    let total: u64 = runs
+        .par_iter()
+        .map(|p| -> Result<u64> {
+            let mut r = BufReader::with_capacity(1024 * 1024, File::open(p)?);
+            let mut count = 0u64;
+            loop {
+                let mut header = [0u8; 12];
+                match r.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as i64;
+                r.seek_relative(len)?;
+                count += 1;
+            }
+            Ok(count)
+        })
+        .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
+    Ok(total)
+}
+
 fn read_record(r: &mut impl Read) -> io::Result<Option<Record>> {
     let mut key_buf = [0u8; 8];
     match r.read_exact(&mut key_buf) {
@@ -1516,6 +1547,12 @@ fn main() -> Result<()> {
     let (unique_passwords, records) = match index.finalize(sort_mode)? {
         FinalizedResult::InMemory(u, r) => (u as usize, Some(r)),
         FinalizedResult::Spilled { runs, sort_mode: sm } => {
+            // Upper bound on unique count (merge still dedups across runs),
+            // but gives the progress bar a real length so ETA isn't stuck
+            // at 0s for the whole merge phase.
+            let estimated_total = count_records_in_runs(&runs)?;
+            write_pb.set_length(estimated_total);
+
             if sm == "unique" {
                 let mut out: Box<dyn Write> = if let Some(ref out_path) = cli.output {
                     Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(out_path)?))
@@ -1570,6 +1607,7 @@ fn main() -> Result<()> {
     }
 
     let records = records.unwrap();
+    write_pb.set_length(records.len() as u64);
     let estimated_output_size: u64 = records.iter().map(|r| (r.pw.len() + 1) as u64).sum();
     const MMAP_OUTPUT_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024;
 
