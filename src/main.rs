@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
@@ -260,7 +260,7 @@ impl CountingIndex {
     fn new(budget_bytes: usize, temp_dir: Option<PathBuf>, progress: ProgressBar) -> Self {
         let spilled_runs = Arc::new(Mutex::new(Vec::new()));
 
-        let (tx, rx) = bounded::<SpillJob>(2);
+        let (tx, rx) = bounded::<SpillJob>(8);
         let writer_temp_dir = temp_dir.clone();
         let writer_runs = Arc::clone(&spilled_runs);
         let writer_progress = progress.clone();
@@ -444,8 +444,17 @@ impl Drop for CountingIndex {
 fn fold_into_dashmap(index: &CountingIndex, local: FastMap<PwKey, u64>) {
     let _guard = index.spill_lock.read();
     for (k, v) in local {
+        // Fast path: probe with a borrowed key first to avoid allocating a
+        // Vec<u8> on every fold when the key is already present (which is
+        // the common case for password lists, since a small number of very
+        // common passwords account for a large share of all lines).
+        if let Some(mut slot) = index.map.get_mut(k.as_slice()) {
+            *slot += v;
+            continue;
+        }
         match index.map.entry(k.to_vec()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                // Lost the race between the probe and the entry() call.
                 *e.get_mut() += v;
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
@@ -461,6 +470,11 @@ fn fold_into_dashmap(index: &CountingIndex, local: FastMap<PwKey, u64>) {
 fn fold_into_dashmap_arena(index: &CountingIndex, local: FastMap<&'static [u8], u64>) {
     let _guard = index.spill_lock.read();
     for (k, v) in local {
+        // Same borrowed-probe-first optimization as fold_into_dashmap.
+        if let Some(mut slot) = index.map.get_mut(k) {
+            *slot += v;
+            continue;
+        }
         match index.map.entry(k.to_vec()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
                 *e.get_mut() += v;
@@ -782,7 +796,7 @@ fn compressed_kind(path: &PathBuf) -> Option<CompressedKind> {
     }
 }
 
-fn open_compressed_reader(path: &PathBuf, kind: &CompressedKind) -> Result<Box<dyn Read>> {
+fn open_compressed_reader(path: &PathBuf, kind: &CompressedKind) -> Result<Box<dyn Read + Send>> {
     let file = File::open(path)?;
     Ok(match kind {
         CompressedKind::Gzip => {
@@ -806,48 +820,10 @@ fn read_file(
     let file = File::open(path)?;
     let file_size = file.metadata()?.len() as usize;
 
-    const SPILL_CHECK_LINES: u64 = 2_000_000;
-
     if let Some(kind) = compressed_kind(path) {
         drop(file);
         let mut reader = open_compressed_reader(path, &kind)?;
-        let mut bytes_read: u64 = 0;
-        let mut last_reported: u64 = 0;
-        let mut lines_since_check: u64 = 0;
-        let mut local: FastMap<PwKey, u64> = FastMap::default();
-        let mut line_buf: Vec<u8> = Vec::with_capacity(256);
-        let mut total_lines: u64 = 0;
-        let mut line_count: u64 = 0;
-        let mut reader = BufReader::with_capacity(1 << 20, &mut *reader);
-
-        loop {
-            line_buf.clear();
-            let n = reader.read_until(b'\n', &mut line_buf)?;
-            if n == 0 {
-                break;
-            }
-            bytes_read += n as u64;
-            total_lines += 1;
-            line_count += 1;
-            lines_since_check += 1;
-            if line_count >= 16384 {
-                pb.inc(bytes_read - last_reported);
-                last_reported = bytes_read;
-                line_count = 0;
-            }
-            if let Some(pw) = extract_password(&line_buf, keep_trailing_colon) {
-                bump_count(&mut local, pw);
-            }
-            if lines_since_check >= SPILL_CHECK_LINES {
-                fold_into_dashmap(index, std::mem::take(&mut local));
-                index.maybe_spill()?;
-                lines_since_check = 0;
-            }
-        }
-        pb.inc(bytes_read - last_reported);
-        fold_into_dashmap(index, local);
-        index.maybe_spill()?;
-        Ok(total_lines)
+        read_compressed_parallel(&mut reader, pb, index, keep_trailing_colon, use_arena)
     } else {
         eprintln!("Processing {} ({} bytes)...", path.display(), file_size);
         let mmap = unsafe { Mmap::map(&file)? };
@@ -920,6 +896,107 @@ fn read_file(
         eprintln!("Finished processing {}.", path.display());
         Ok(total_lines)
     }
+}
+
+/// Decouples decompression from counting for gz/zst inputs. A single
+/// producer thread reads and decompresses into large byte buffers (breaking
+/// on line boundaries) and pushes them through a bounded channel; a pool of
+/// rayon worker threads consume buffers and run the same parallel
+/// count_chunk/count_chunk_arena logic used for mmap'd plain-text input.
+/// This restores multi-core scaling for compressed inputs, which were
+/// previously bottlenecked on a single decompressing/hashing thread.
+fn read_compressed_parallel(
+    reader: &mut Box<dyn Read + Send>,
+    pb: &ProgressBar,
+    index: &CountingIndex,
+    keep_trailing_colon: bool,
+    use_arena: bool,
+) -> Result<u64> {
+    const DECOMPRESS_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+    // Bound the channel so the producer can't run arbitrarily far ahead of
+    // consumers and blow up memory; a handful of in-flight buffers is
+    // enough to keep workers fed without unbounded buffering.
+    let (tx, rx) = bounded::<Vec<u8>>(rayon::current_num_threads().max(2) * 2);
+
+    let lines_done = Arc::new(AtomicU64::new(0));
+    let lines_done_producer = Arc::clone(&lines_done);
+
+    let num_threads = rayon::current_num_threads();
+
+    let result: Result<u64> = std::thread::scope(|scope| {
+        // Producer: read + decompress into DECOMPRESS_CHUNK_SIZE-ish buffers,
+        // always breaking on a line boundary so consumers can process each
+        // buffer independently without needing to stitch partial lines.
+        let producer = scope.spawn(move || -> Result<()> {
+            let mut buf: Vec<u8> = Vec::with_capacity(DECOMPRESS_CHUNK_SIZE + 4096);
+            let mut read_buf = [0u8; 256 * 1024];
+            loop {
+                let n = reader.read(&mut read_buf)?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&read_buf[..n]);
+                if buf.len() >= DECOMPRESS_CHUNK_SIZE {
+                    // Cut at the last newline so we never split a line
+                    // across two buffers.
+                    if let Some(last_nl) = memchr::memrchr(b'\n', &buf) {
+                        let remainder = buf.split_off(last_nl + 1);
+                        if tx.send(std::mem::replace(&mut buf, remainder)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    // If there's no newline yet (single huge line), keep
+                    // accumulating rather than sending a partial line.
+                }
+            }
+            if !buf.is_empty() {
+                let _ = tx.send(buf);
+            }
+            Ok(())
+        });
+
+        // Consumers: pull buffers off the channel and count them in
+        // parallel via rayon, folding into the shared DashMap just like the
+        // mmap path does.
+        let pool = if use_arena {
+            Some(arena_pool(num_threads))
+        } else {
+            None
+        };
+
+        rayon::scope(|s| {
+            for _ in 0..num_threads {
+                let rx = rx.clone();
+                let lines_done = Arc::clone(&lines_done_producer);
+                s.spawn(move |_| {
+                    while let Ok(chunk) = rx.recv() {
+                        let chunk_len = chunk.len() as u64;
+                        if use_arena {
+                            let m = count_chunk_arena(&chunk, keep_trailing_colon, pool.unwrap());
+                            let lines: u64 = m.values().sum();
+                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
+                            fold_into_dashmap_arena(index, m);
+                        } else {
+                            let m = count_chunk(&chunk, keep_trailing_colon);
+                            let lines: u64 = m.values().sum();
+                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
+                            fold_into_dashmap(index, m);
+                        }
+                        pb.inc(chunk_len);
+                        // Opportunistically check whether we need to spill;
+                        // maybe_spill() is cheap (atomic load) when under
+                        // budget, so this is safe to call frequently.
+                        let _ = index.maybe_spill();
+                    }
+                });
+            }
+        });
+
+        producer.join().map_err(|_| anyhow::anyhow!("compressed-input reader thread panicked"))??;
+        Ok(lines_done_producer.load(AtomicOrdering::Relaxed))
+    });
+
+    result
 }
 
 #[derive(Clone)]
