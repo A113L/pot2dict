@@ -21,6 +21,7 @@ rustc-hash = "2.0"
 mimalloc = "0.1.52"
 parking_lot = "0.12.5"
 smallvec = "1.15.2"
+crossbeam-channel = "0.5"
 
 [profile.release]
 opt-level = 3
