@@ -15,9 +15,12 @@ sysinfo = "0.32"
 anyhow = "1.0"
 memchr = "2.7"
 hashbrown = "0.15"
-dashmap = "6.1"
+dashmap = { version = "6.1", features = ["rayon"] }
 bumpalo = "3.16"
 rustc-hash = "2.0"
+mimalloc = "0.1.52"
+parking_lot = "0.12.5"
+smallvec = "1.15.2"
 
 [profile.release]
 opt-level = 3
