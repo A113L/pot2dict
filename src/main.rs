@@ -311,25 +311,10 @@ impl CountingIndex {
                     let mut entries = job.entries;
                     entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-                    let temp = if let Some(ref dir) = writer_temp_dir {
-                        NamedTempFile::new_in(dir)?
-                    } else {
-                        NamedTempFile::new()?
-                    };
-                    {
-                        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
-                        for (pw, count) in &entries {
-                            write_record(
-                                &mut writer,
-                                &Record {
-                                    key: *count as i64,
-                                    pw: pw.clone(),
-                                },
-                            )?;
-                        }
-                        writer.flush()?;
-                    }
-                    writer_runs.lock().push(temp.into_temp_path());
+                    // key = count as-is (unique-run format); frequency
+                    // sign-flip happens later in the merge/finalize step.
+                    let temp_path = write_entries_to_temp(&entries, &writer_temp_dir, false)?;
+                    writer_runs.lock().push(temp_path);
                 }
                 Ok(())
             })
@@ -452,25 +437,8 @@ impl CountingIndex {
                 .map(|entry| (entry.key().clone(), *entry.value()))
                 .collect();
             entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            let temp = if let Some(ref dir) = self.temp_dir {
-                NamedTempFile::new_in(dir)?
-            } else {
-                NamedTempFile::new()?
-            };
-            {
-                let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
-                for (pw, count) in &entries {
-                    write_record(
-                        &mut writer,
-                        &Record {
-                            key: *count as i64,
-                            pw: pw.clone(),
-                        },
-                    )?;
-                }
-                writer.flush()?;
-            }
-            spilled_runs.push(temp.into_temp_path());
+            let temp_path = write_entries_to_temp(&entries, &self.temp_dir, false)?;
+            spilled_runs.push(temp_path);
         }
 
         eprintln!(
@@ -734,19 +702,8 @@ fn external_sort_spilled_runs(
 
         ensure_disk_space(&spill_dir, chunk_bytes as u64, "sorted chunk run")?;
 
-        let temp = if let Some(ref dir) = temp_dir {
-            NamedTempFile::new_in(dir)?
-        } else {
-            NamedTempFile::new()?
-        };
-        {
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
-            for r in &chunk {
-                write_record(&mut writer, r)?;
-            }
-            writer.flush()?;
-        }
-        temp_files.push(temp.into_temp_path());
+        let temp_path = write_records_to_temp(&chunk, &temp_dir)?;
+        temp_files.push(temp_path);
     }
 
     struct HeapEntry {
@@ -1084,6 +1041,144 @@ fn write_output_mmap(records: &[Record], out_path: &PathBuf, progress: &Progress
     Ok(())
 }
 
+// --- Perf: mmap writes for temp/spill run files --------------------------
+// Below this size, mmap's setup cost (open+ftruncate+mmap+msync) outweighs
+// what it saves versus a plain BufWriter; the small-run case also isn't
+// where spill/sort I/O time is actually going. Above it, parallel
+// pointer-copy into a pre-sized mapping beats one thread serializing
+// through write_all() per record.
+const MMAP_TEMP_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MB
+
+#[inline]
+fn record_encoded_len(pw_len: usize) -> usize {
+    8 + 4 + pw_len // i64 key + u32 length prefix + payload
+}
+
+/// Serializes `(password, count)` entries (the natural output of a
+/// drained/summed counting-index chunk) to `path` in the same
+/// [key: i64 LE][len: u32 LE][pw bytes] record format `write_record`
+/// produces, via a parallel mmap write when the run is large enough to be
+/// worth it, falling back to a buffered sequential writer otherwise.
+/// `key` is written as `count as i64` (matches the "unique" spill format;
+/// callers wanting the frequency-sorted `-(count as i64)` encoding should
+/// negate before calling, as CountingIndex's spill writer does).
+fn write_entries_to_temp(
+    entries: &[(Vec<u8>, u64)],
+    temp_dir: &Option<PathBuf>,
+    negate_key: bool,
+) -> Result<tempfile::TempPath> {
+    let total_size: u64 = entries
+        .iter()
+        .map(|(pw, _)| record_encoded_len(pw.len()) as u64)
+        .sum();
+
+    let temp = if let Some(dir) = temp_dir {
+        NamedTempFile::new_in(dir)?
+    } else {
+        NamedTempFile::new()?
+    };
+
+    if total_size >= MMAP_TEMP_FILE_THRESHOLD {
+        let mut offsets: Vec<usize> = Vec::with_capacity(entries.len() + 1);
+        let mut acc = 0usize;
+        offsets.push(0);
+        for (pw, _) in entries {
+            acc += record_encoded_len(pw.len());
+            offsets.push(acc);
+        }
+
+        let file = temp.as_file();
+        file.set_len(acc as u64)?;
+        let mut mmap = unsafe { MmapMut::map_mut(file)? };
+        let base = SyncMmapMut(mmap.as_mut_ptr(), mmap.len());
+
+        entries.par_iter().enumerate().for_each(|(i, (pw, count))| {
+            let start = offsets[i];
+            debug_assert_eq!(offsets[i + 1] - start, record_encoded_len(pw.len()));
+            let key: i64 = if negate_key {
+                -(*count as i64)
+            } else {
+                *count as i64
+            };
+            unsafe {
+                let dst = base.ptr().add(start);
+                std::ptr::copy_nonoverlapping(key.to_le_bytes().as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping((pw.len() as u32).to_le_bytes().as_ptr(), dst.add(8), 4);
+                std::ptr::copy_nonoverlapping(pw.as_ptr(), dst.add(12), pw.len());
+            }
+        });
+
+        mmap.flush()?;
+        file.sync_all()?;
+    } else {
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
+        for (pw, count) in entries {
+            let key: i64 = if negate_key {
+                -(*count as i64)
+            } else {
+                *count as i64
+            };
+            write_record(&mut writer, &Record { key, pw: pw.clone() })?;
+        }
+        writer.flush()?;
+    }
+
+    Ok(temp.into_temp_path())
+}
+
+/// Same as `write_entries_to_temp` but for a slice of already-built
+/// `Record`s (used by the sort-phase chunk spills, where key is already
+/// whatever sign/value the caller wants).
+fn write_records_to_temp(records: &[Record], temp_dir: &Option<PathBuf>) -> Result<tempfile::TempPath> {
+    let total_size: u64 = records
+        .iter()
+        .map(|r| record_encoded_len(r.pw.len()) as u64)
+        .sum();
+
+    let temp = if let Some(dir) = temp_dir {
+        NamedTempFile::new_in(dir)?
+    } else {
+        NamedTempFile::new()?
+    };
+
+    if total_size >= MMAP_TEMP_FILE_THRESHOLD {
+        let mut offsets: Vec<usize> = Vec::with_capacity(records.len() + 1);
+        let mut acc = 0usize;
+        offsets.push(0);
+        for r in records {
+            acc += record_encoded_len(r.pw.len());
+            offsets.push(acc);
+        }
+
+        let file = temp.as_file();
+        file.set_len(acc as u64)?;
+        let mut mmap = unsafe { MmapMut::map_mut(file)? };
+        let base = SyncMmapMut(mmap.as_mut_ptr(), mmap.len());
+
+        records.par_iter().enumerate().for_each(|(i, r)| {
+            let start = offsets[i];
+            debug_assert_eq!(offsets[i + 1] - start, record_encoded_len(r.pw.len()));
+            unsafe {
+                let dst = base.ptr().add(start);
+                std::ptr::copy_nonoverlapping(r.key.to_le_bytes().as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping((r.pw.len() as u32).to_le_bytes().as_ptr(), dst.add(8), 4);
+                std::ptr::copy_nonoverlapping(r.pw.as_ptr(), dst.add(12), r.pw.len());
+            }
+        });
+
+        mmap.flush()?;
+        file.sync_all()?;
+    } else {
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
+        for r in records {
+            write_record(&mut writer, r)?;
+        }
+        writer.flush()?;
+    }
+
+    Ok(temp.into_temp_path())
+}
+
 fn sort_and_write(
     mut records: Vec<Record>,
     max_mem_bytes: usize,
@@ -1125,19 +1220,8 @@ fn sort_and_write(
     for chunk in records.chunks_mut(chunk_len) {
         chunk.par_sort_unstable();
 
-        let temp = if let Some(ref dir) = temp_dir {
-            NamedTempFile::new_in(dir)?
-        } else {
-            NamedTempFile::new()?
-        };
-        {
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
-            for r in chunk.iter() {
-                write_record(&mut writer, r)?;
-            }
-            writer.flush()?;
-        }
-        temp_files.push(temp.into_temp_path());
+        let temp_path = write_records_to_temp(chunk, &temp_dir)?;
+        temp_files.push(temp_path);
     }
     drop(records);
 
