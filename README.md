@@ -116,17 +116,19 @@ Both spill paths write to `--temp-dir` if given, otherwise the system temp direc
 
 Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three runs on large plain-text wordlists with a tight counting budget (--count-mem=0.2):
 
-| Metric                | Run 1 (21.16 GB) | Run 2 (8.93 GB) | Run 3 (3.39 GB) | Trend           |
-| --------------------- | ---------------- | ---------------- | ---------------- | --------------- |
-| **Input Size**        | 21.16 GiB        | 8.93 GiB          | 3.39 GiB          | —               |
-| **Input : RAM Ratio** | 2.6×              | 1.1×              | **0.42×**         | ↓ Less pressure |
-| **Total Lines**       | 1.75B             | 838M              | 329M              | —               |
-| **Unique Lines**      | 1.45B             | 514M              | 253M              | —               |
-| **Duplication Rate**  | 16.9%             | **38.6%**         | 23.0%             | —               |
-| **Spill Runs**        | 61                | 29                | **10**            | ↓ Fewer spills  |
-| **Wall Time**         | 106m 15s          | 51m 37s           | **18m 4s**        | ↓ Sub-linear    |
-| **Lines/Second**      | 273,700           | 270,700           | **303,100**       | ↑ Faster!       |
-| **MB/Second**         | 3.3               | 2.9               | **3.2**           | Stable          |
+| Metric                        | Run 1 (44.85 GB) | Run 2 (21.16 GB) | Run 3 (8.93 GB) | Run 4 (3.39 GB) | Trend           |
+| ----------------------------- | ---------------- | ---------------- | --------------- | --------------- | --------------- |
+| **Input Size**                | 44.85 GiB        | 21.16 GiB        | 8.93 GiB        | 3.39 GiB        | —               |
+| **Input : RAM Ratio**         | 5.5×             | 2.6×             | 1.1×            | **0.42×**       | ↓ Less pressure |
+| **Count Mem** (`--count-mem`) | 0.15             | 0.20             | 0.20            | 0.20            | —               |
+| **Max Mem** (`--max-mem`)     | 0.40             | 0.50             | 0.50            | 0.50            | —               |
+| **Total Lines**               | 3.94B            | 1.75B            | 838M            | 329M            | —               |
+| **Unique Lines**              | 2.77B            | 1.45B            | 514M            | 253M            | —               |
+| **Duplication Rate**          | 29.5%            | 16.9%            | **38.6%**       | 23.0%           | —               |
+| **Spill Runs**                | 178              | 61               | 29              | **10**          | ↓ Fewer spills  |
+| **Wall Time**                 | 256m 52s         | 106m 15s         | 51m 37s         | **18m 4s**      | ↓ Sub-linear    |
+| **Lines/Second**              | 255,300          | 273,700          | 270,700         | **303,100**     | ↑ Faster!       |
+| **MB/Second**                 | 3.0              | 3.3              | 2.9             | **3.2**         | Stable          |
 
 ## License
 
