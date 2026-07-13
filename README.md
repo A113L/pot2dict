@@ -29,7 +29,7 @@ This is a deliberate tradeoff. Tools that keep everything in memory (`awk '!seen
 
 ## Example run (low-RAM, spill-heavy)
 
-Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three runs on large plain-text wordlists with a tight counting budget:
+Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three runs on large plain-text wordlists with a tight counting budget (--count-mem=0.2):
 
 
 | Metric                | Run 1 (21.16 GB) | Run 2 (8.93 GB) | Run 3 (3.39 GB) | Trend           |
