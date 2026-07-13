@@ -27,6 +27,34 @@ This is a deliberate tradeoff. Tools that keep everything in memory (`awk '!seen
 - **Disk placement matters more than CPU on low-RAM runs.** Since spilling and merging are I/O-bound, put `--temp-dir` on a different physical disk than your input file if possible, and prefer SSD over HDD — this typically has a bigger impact on wall-clock time than thread count once you're spilling heavily.
 - `--arena` trades memory for speed by never freeing key allocations for the life of the run — avoid it on low-RAM machines with large or low-duplication inputs, since it works against the same memory constraints this tool is otherwise designed to respect.
 
+## Example run (low-RAM, spill-heavy)
+
+Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three large plain-text wordlists (~21 GB combined) with a tight counting budget:
+
+```bash
+time ./pot2dict wordlist_a.txt wordlist_b.txt wordlist_c.txt \
+  -p 12 --unique --keep-trailing-colon -o merged.txt \
+  --temp-dir /mnt/data/tmp \
+  --count-mem 0.20 --chunk-batch-size 2 --mmap-output
+```
+
+| Stat                     | Value                            |
+| ------------------------ | -------------------------------- |
+| **System RAM**           | 8 GB                             |
+| **Total Input Size**     | 21.16 GiB (2.6× RAM)             |
+| **Files Processed**      | 3                                |
+| **Total Lines**          | 1,746,922,348 (~1.75B)           |
+| **Unique Passwords**     | 1,451,675,930 (~1.45B)           |
+| **Duplication Rate**     | 16.9%                            |
+| **Threads**              | 12                                |
+| **Count Memory Budget**  | 1.53 GB (19% of RAM)             |
+| **Max Memory Budget**    | ~4 GB (50% of RAM, default)      |
+| **Chunk Batch Size**     | 2                                 |
+| **Temp Directory**       | `/mnt/data/tmp` (163.73 GB free) |
+| **Spill Runs Created**   | 61                                |
+| **Peak Temp Space Used** | ~93 GB (estimated)               |
+
+
 ## Install
 
 ```bash
