@@ -10,7 +10,6 @@ use anyhow::Result;
 use bumpalo::Bump;
 use clap::Parser;
 use dashmap::DashMap;
-use flate2::read::MultiGzDecoder;
 use hashbrown::HashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::{Mmap, MmapMut};
@@ -179,21 +178,51 @@ fn with_refreshed_disks<T>(f: impl FnOnce(&Disks) -> T) -> T {
     f(&guard.disks)
 }
 
+// Per-path cache for available_space_for(). ensure_disk_space() is called
+// once per spill run, which with multiple concurrent spill-writer threads
+// can happen many times a second; without this, every single call pays for
+// a canonicalize() syscall plus a full scan/filter over the disk list. The
+// underlying disk stats themselves are only refreshed at most once per
+// DISK_REFRESH_INTERVAL anyway (see with_refreshed_disks), so caching the
+// resolved per-path answer on the same interval loses no real freshness.
+static AVAIL_SPACE_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, (Instant, Option<u64>)>>> =
+    OnceLock::new();
+
 fn available_space_for(path: &std::path::Path) -> Option<u64> {
+    let cache = AVAIL_SPACE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    if let Some((ts, val)) = cache.lock().get(path) {
+        if ts.elapsed() < DISK_REFRESH_INTERVAL {
+            return *val;
+        }
+    }
+
     let probe = if path.exists() {
         path.to_path_buf()
     } else {
-        path.ancestors().find(|p| p.exists())?.to_path_buf()
+        match path.ancestors().find(|p| p.exists()) {
+            Some(p) => p.to_path_buf(),
+            None => {
+                cache.lock().insert(path.to_path_buf(), (Instant::now(), None));
+                return None;
+            }
+        }
     };
-    let probe = probe.canonicalize().ok()?;
+    let Ok(probe) = probe.canonicalize() else {
+        cache.lock().insert(path.to_path_buf(), (Instant::now(), None));
+        return None;
+    };
 
-    with_refreshed_disks(|disks| {
+    let result = with_refreshed_disks(|disks| {
         disks
             .iter()
             .filter(|d| probe.starts_with(d.mount_point()))
             .max_by_key(|d| d.mount_point().as_os_str().len())
             .map(|d| d.available_space())
-    })
+    });
+
+    cache.lock().insert(path.to_path_buf(), (Instant::now(), result));
+    result
 }
 
 fn ensure_disk_space(dir: &std::path::Path, estimated_bytes: u64, context: &str) -> Result<()> {
@@ -251,10 +280,10 @@ pub struct CountingIndex {
     spilled_runs: Arc<Mutex<Vec<tempfile::TempPath>>>,
     spill_lock: RwLock<()>,
     spill_tx: Mutex<Option<Sender<SpillJob>>>,
-    // Pool of spill-writer threads (see CountingIndex::new). Using several
-    // threads instead of one lets sort+write for one spill run overlap
-    // with sort+write for another, so spilling doesn't serialize behind a
-    // single worker under I/O pressure.
+    // Pool of spill-writer threads (see CountingIndex::new). Multiple
+    // threads let sort+write for one spill run overlap with another,
+    // instead of serializing all spills behind a single worker whenever
+    // the temp disk is slow or contended.
     spill_threads: Mutex<Vec<std::thread::JoinHandle<Result<()>>>>,
     progress: ProgressBar,
     spill_count: AtomicUsize,
@@ -268,17 +297,27 @@ impl CountingIndex {
         let writer_temp_dir = temp_dir.clone();
         let writer_runs = Arc::clone(&spilled_runs);
         let writer_progress = progress.clone();
-
-        // Use multiple spill-writer threads pulling from the same mpmc
-        // channel (crossbeam_channel::Receiver is Clone + safe to share)
-        // so that sorting/writing one spill run can overlap with another,
-        // instead of serializing all spills behind a single thread. This
-        // matters a lot once spill counts get large and/or the temp disk
-        // is slow: a single-threaded writer means the whole pipeline
-        // stalls the moment one write is slow.
-        const SPILL_WRITER_THREADS: usize = 3;
-        let mut spill_threads = Vec::with_capacity(SPILL_WRITER_THREADS);
-        for worker_id in 0..SPILL_WRITER_THREADS {
+        // Use several spill-writer threads pulling from the same mpmc
+        // channel (crossbeam_channel::Receiver is Clone and safe to share
+        // across threads) so that sort+write for one spill run can overlap
+        // with another, instead of serializing every spill behind a single
+        // worker. This matters most once spill counts get large and/or the
+        // temp disk is slow: with one writer thread, the whole counting
+        // pipeline stalls the moment a single write is slow, because the
+        // bounded channel fills up and producer threads block on send().
+        //
+        // Thread count scales off rayon::current_num_threads() (i.e. -p /
+        // number of cores), not a fixed constant: a wider -p implies both
+        // faster spill production (more producer threads feeding the
+        // channel) and typically more concurrent I/O capacity available, so
+        // a single-machine-sized magic number under- or over-provisions
+        // depending on hardware. Clamped to a sane range since spill
+        // writing is disk-bound, not CPU-bound — beyond a handful of
+        // threads, more of them just contends for the same I/O queue
+        // without adding throughput.
+        let spill_writer_threads = (rayon::current_num_threads() / 4).clamp(2, 8);
+        let mut spill_threads = Vec::with_capacity(spill_writer_threads);
+        for worker_id in 0..spill_writer_threads {
             let rx = rx.clone();
             let writer_temp_dir = writer_temp_dir.clone();
             let writer_runs = Arc::clone(&writer_runs);
@@ -296,6 +335,13 @@ impl CountingIndex {
                         ensure_disk_space(&spill_dir, approx_bytes, "counting-phase spill")?;
 
                         let mut entries = job.entries;
+                        // Safe to use the parallel sort here: compressed-file
+                        // support (which used to permanently pin every rayon
+                        // worker thread) has been removed, so this can
+                        // freely borrow CPU cores from the global pool even
+                        // while multiple spill-writer threads are doing the
+                        // same thing concurrently — rayon's work-stealing
+                        // scheduler handles concurrent scope calls fine.
                         entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
                         let temp_path = write_entries_to_temp(&entries, &writer_temp_dir, false)?;
@@ -453,7 +499,7 @@ impl CountingIndex {
 impl Drop for CountingIndex {
     fn drop(&mut self) {
         // If finalize() already ran, spill_tx/spill_threads are already
-        // None/joined and this is a no-op. If we're here because an error
+        // empty/joined and this is a no-op. If we're here because an error
         // propagated out before finalize() was called, close the channel
         // (so rx.recv() unblocks) and join the writer threads.
         self.spill_tx.lock().take();
@@ -805,32 +851,6 @@ fn split_into_chunks(data: &[u8], target_chunk_size: usize) -> Vec<&[u8]> {
     chunks
 }
 
-enum CompressedKind {
-    Gzip,
-    Zstd,
-}
-
-fn compressed_kind(path: &PathBuf) -> Option<CompressedKind> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("gz") => Some(CompressedKind::Gzip),
-        Some("zst") | Some("zstd") => Some(CompressedKind::Zstd),
-        _ => None,
-    }
-}
-
-fn open_compressed_reader(path: &PathBuf, kind: &CompressedKind) -> Result<Box<dyn Read + Send>> {
-    let file = File::open(path)?;
-    Ok(match kind {
-        CompressedKind::Gzip => {
-            Box::new(BufReader::with_capacity(64 * 1024, MultiGzDecoder::new(file)))
-        }
-        CompressedKind::Zstd => {
-            let decoder = zstd::stream::read::Decoder::new(file)?;
-            Box::new(BufReader::with_capacity(64 * 1024, decoder))
-        }
-    })
-}
-
 fn read_file(
     path: &PathBuf,
     pb: &ProgressBar,
@@ -842,183 +862,76 @@ fn read_file(
     let file = File::open(path)?;
     let file_size = file.metadata()?.len() as usize;
 
-    if let Some(kind) = compressed_kind(path) {
-        drop(file);
-        let mut reader = open_compressed_reader(path, &kind)?;
-        read_compressed_parallel(&mut reader, pb, index, keep_trailing_colon, use_arena)
-    } else {
-        eprintln!("Processing {} ({} bytes)...", path.display(), file_size);
-        let mmap = unsafe { Mmap::map(&file)? };
-        #[cfg(unix)]
-        {
-            let _ = mmap.advise(memmap2::Advice::Sequential);
-        }
-        const IO_CHUNK_SIZE: usize = 16 * 1024 * 1024;
-        let chunks = split_into_chunks(&mmap, IO_CHUNK_SIZE);
-        eprintln!("Split into {} chunks.", chunks.len());
-
-        let total_chunks = chunks.len();
-        let chunks_done = AtomicU64::new(0);
-        let lines_done = AtomicU64::new(0);
-
-        let batch_size: usize =
-            chunk_batch_size.unwrap_or_else(|| rayon::current_num_threads()).max(1);
-
-        for batch in chunks.chunks(batch_size) {
-            if use_arena {
-                let pool = arena_pool(rayon::current_num_threads());
-                batch
-                    .par_iter()
-                    .fold(
-                        || FastMap::<&'static [u8], u64>::default(),
-                        |mut acc, chunk| {
-                            let m = count_chunk_arena(chunk, keep_trailing_colon, pool);
-                            let lines: u64 = m.values().sum();
-                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
-                            let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                            pb.inc(chunk.len() as u64);
-                            if done % 16 == 0 || done == total_chunks as u64 {
-                                pb.set_message(format!("{} / {} chunks done", done, total_chunks));
-                            }
-                            acc.reserve(m.len());
-                            for (k, v) in m {
-                                *acc.entry(k).or_insert(0) += v;
-                            }
-                            acc
-                        },
-                    )
-                    .for_each(|local| fold_into_dashmap_arena(index, local));
-            } else {
-                batch
-                    .par_iter()
-                    .fold(
-                        || FastMap::<PwKey, u64>::default(),
-                        |mut acc, chunk| {
-                            let m = count_chunk(chunk, keep_trailing_colon);
-                            let lines: u64 = m.values().sum();
-                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
-                            let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                            pb.inc(chunk.len() as u64);
-                            if done % 16 == 0 || done == total_chunks as u64 {
-                                pb.set_message(format!("{} / {} chunks done", done, total_chunks));
-                            }
-                            acc.reserve(m.len());
-                            for (k, v) in m {
-                                *acc.entry(k).or_insert(0) += v;
-                            }
-                            acc
-                        },
-                    )
-                    .for_each(|local| fold_into_dashmap(index, local));
-            }
-            index.maybe_spill()?;
-        }
-
-        let total_lines = lines_done.load(AtomicOrdering::Relaxed);
-        eprintln!("Finished processing {}.", path.display());
-        Ok(total_lines)
+    eprintln!("Processing {} ({} bytes)...", path.display(), file_size);
+    let mmap = unsafe { Mmap::map(&file)? };
+    #[cfg(unix)]
+    {
+        let _ = mmap.advise(memmap2::Advice::Sequential);
     }
-}
+    const IO_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+    let chunks = split_into_chunks(&mmap, IO_CHUNK_SIZE);
+    eprintln!("Split into {} chunks.", chunks.len());
 
-/// Decouples decompression from counting for gz/zst inputs. A single
-/// producer thread reads and decompresses into large byte buffers (breaking
-/// on line boundaries) and pushes them through a bounded channel; a pool of
-/// rayon worker threads consume buffers and run the same parallel
-/// count_chunk/count_chunk_arena logic used for mmap'd plain-text input.
-/// This restores multi-core scaling for compressed inputs, which were
-/// previously bottlenecked on a single decompressing/hashing thread.
-fn read_compressed_parallel(
-    reader: &mut Box<dyn Read + Send>,
-    pb: &ProgressBar,
-    index: &CountingIndex,
-    keep_trailing_colon: bool,
-    use_arena: bool,
-) -> Result<u64> {
-    const DECOMPRESS_CHUNK_SIZE: usize = 16 * 1024 * 1024;
-    // Bound the channel so the producer can't run arbitrarily far ahead of
-    // consumers and blow up memory; a handful of in-flight buffers is
-    // enough to keep workers fed without unbounded buffering.
-    let (tx, rx) = bounded::<Vec<u8>>(rayon::current_num_threads().max(2) * 2);
+    let total_chunks = chunks.len();
+    let chunks_done = AtomicU64::new(0);
+    let lines_done = AtomicU64::new(0);
 
-    let lines_done = Arc::new(AtomicU64::new(0));
-    let lines_done_producer = Arc::clone(&lines_done);
+    let batch_size: usize =
+        chunk_batch_size.unwrap_or_else(|| rayon::current_num_threads()).max(1);
 
-    let num_threads = rayon::current_num_threads();
-
-    let result: Result<u64> = std::thread::scope(|scope| {
-        // Producer: read + decompress into DECOMPRESS_CHUNK_SIZE-ish buffers,
-        // always breaking on a line boundary so consumers can process each
-        // buffer independently without needing to stitch partial lines.
-        let producer = scope.spawn(move || -> Result<()> {
-            let mut buf: Vec<u8> = Vec::with_capacity(DECOMPRESS_CHUNK_SIZE + 4096);
-            let mut read_buf = [0u8; 256 * 1024];
-            loop {
-                let n = reader.read(&mut read_buf)?;
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&read_buf[..n]);
-                if buf.len() >= DECOMPRESS_CHUNK_SIZE {
-                    // Cut at the last newline so we never split a line
-                    // across two buffers.
-                    if let Some(last_nl) = memchr::memrchr(b'\n', &buf) {
-                        let remainder = buf.split_off(last_nl + 1);
-                        if tx.send(std::mem::replace(&mut buf, remainder)).is_err() {
-                            return Ok(());
+    for batch in chunks.chunks(batch_size) {
+        if use_arena {
+            let pool = arena_pool(rayon::current_num_threads());
+            batch
+                .par_iter()
+                .fold(
+                    || FastMap::<&'static [u8], u64>::default(),
+                    |mut acc, chunk| {
+                        let m = count_chunk_arena(chunk, keep_trailing_colon, pool);
+                        let lines: u64 = m.values().sum();
+                        lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
+                        let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                        pb.inc(chunk.len() as u64);
+                        if done % 16 == 0 || done == total_chunks as u64 {
+                            pb.set_message(format!("{} / {} chunks done", done, total_chunks));
                         }
-                    }
-                    // If there's no newline yet (single huge line), keep
-                    // accumulating rather than sending a partial line.
-                }
-            }
-            if !buf.is_empty() {
-                let _ = tx.send(buf);
-            }
-            Ok(())
-        });
-
-        // Consumers: pull buffers off the channel and count them in
-        // parallel via rayon, folding into the shared DashMap just like the
-        // mmap path does.
-        let pool = if use_arena {
-            Some(arena_pool(num_threads))
+                        acc.reserve(m.len());
+                        for (k, v) in m {
+                            *acc.entry(k).or_insert(0) += v;
+                        }
+                        acc
+                    },
+                )
+                .for_each(|local| fold_into_dashmap_arena(index, local));
         } else {
-            None
-        };
-
-        rayon::scope(|s| {
-            for _ in 0..num_threads {
-                let rx = rx.clone();
-                let lines_done = Arc::clone(&lines_done_producer);
-                s.spawn(move |_| {
-                    while let Ok(chunk) = rx.recv() {
-                        let chunk_len = chunk.len() as u64;
-                        if use_arena {
-                            let m = count_chunk_arena(&chunk, keep_trailing_colon, pool.unwrap());
-                            let lines: u64 = m.values().sum();
-                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
-                            fold_into_dashmap_arena(index, m);
-                        } else {
-                            let m = count_chunk(&chunk, keep_trailing_colon);
-                            let lines: u64 = m.values().sum();
-                            lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
-                            fold_into_dashmap(index, m);
+            batch
+                .par_iter()
+                .fold(
+                    || FastMap::<PwKey, u64>::default(),
+                    |mut acc, chunk| {
+                        let m = count_chunk(chunk, keep_trailing_colon);
+                        let lines: u64 = m.values().sum();
+                        lines_done.fetch_add(lines, AtomicOrdering::Relaxed);
+                        let done = chunks_done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                        pb.inc(chunk.len() as u64);
+                        if done % 16 == 0 || done == total_chunks as u64 {
+                            pb.set_message(format!("{} / {} chunks done", done, total_chunks));
                         }
-                        pb.inc(chunk_len);
-                        // Opportunistically check whether we need to spill;
-                        // maybe_spill() is cheap (atomic load) when under
-                        // budget, so this is safe to call frequently.
-                        let _ = index.maybe_spill();
-                    }
-                });
-            }
-        });
+                        acc.reserve(m.len());
+                        for (k, v) in m {
+                            *acc.entry(k).or_insert(0) += v;
+                        }
+                        acc
+                    },
+                )
+                .for_each(|local| fold_into_dashmap(index, local));
+        }
+        index.maybe_spill()?;
+    }
 
-        producer.join().map_err(|_| anyhow::anyhow!("compressed-input reader thread panicked"))??;
-        Ok(lines_done_producer.load(AtomicOrdering::Relaxed))
-    });
-
-    result
+    let total_lines = lines_done.load(AtomicOrdering::Relaxed);
+    eprintln!("Finished processing {}.", path.display());
+    Ok(total_lines)
 }
 
 #[derive(Clone)]
@@ -1196,6 +1109,10 @@ fn write_entries_to_temp(
         let mut mmap = unsafe { MmapMut::map_mut(file)? };
         let base = SyncMmapMut(mmap.as_mut_ptr(), mmap.len());
 
+        // Safe to use par_iter() here: nothing in this program permanently
+        // pins every rayon worker thread anymore (compressed-file support,
+        // which used to do that, has been removed), so this parallel copy
+        // can freely use all CPU cores for maximum spill-write throughput.
         entries.par_iter().enumerate().for_each(|(i, (pw, count))| {
             let start = offsets[i];
             debug_assert_eq!(offsets[i + 1] - start, record_encoded_len(pw.len()));
@@ -1214,13 +1131,14 @@ fn write_entries_to_temp(
 
         mmap.flush()?;
         // NOTE: intentionally no file.sync_all() here — these are scratch
-        // spill files, not durable output. fsync() was serializing the
-        // spill-writer thread(s) behind blocking disk writeback, which
-        // stalled the whole pipeline whenever the underlying disk was slow
-        // or contended (e.g. under swap pressure, or a shared temp-dir
-        // disk). mmap.flush() makes the data visible to subsequent reads
-        // within this process; full durability isn't required here since a
-        // crash mid-run just means rerunning the tool from scratch.
+        // spill files, not durable output. fsync() forces a blocking wait
+        // for the kernel to physically flush dirty pages, which serializes
+        // whichever thread calls it behind disk writeback — under I/O
+        // pressure (slow/contended temp-dir disk, concurrent swap activity)
+        // this can stall the entire spill pipeline behind one write.
+        // mmap.flush() makes the data visible to subsequent reads within
+        // this process, which is all that's needed: a crash mid-run just
+        // means rerunning the tool, no durability guarantee required.
     } else {
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &temp);
         for (pw, count) in entries {
