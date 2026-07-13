@@ -1380,8 +1380,15 @@ struct Cli {
     #[arg(long, default_value_t = 0.5)]
     max_mem: f64,
 
-    #[arg(long, default_value_t = 0.3)]
-    count_mem: f64,
+    /// Counting-phase memory budget, as a fraction of total host RAM
+    /// (suggested value: 0.20). Unlike --max-mem, this flag is NOT
+    /// enforced unless it is explicitly passed on the command line: if
+    /// --count-mem is omitted entirely, no counting-phase memory cap is
+    /// applied at all (the in-flight hash map is allowed to grow without
+    /// spilling to disk based on RAM usage). Pass an explicit value to
+    /// opt back into the budgeted/spilling behavior.
+    #[arg(long)]
+    count_mem: Option<f64>,
 
     #[arg(long)]
     chunk_batch_size: Option<usize>,
@@ -1407,6 +1414,11 @@ struct Cli {
     #[arg(long)]
     parallel_files: bool,
 }
+
+/// Suggested --count-mem fraction shown in logs/help when the flag is used
+/// without a caller-supplied rationale elsewhere. This is NOT applied
+/// automatically — see the doc comment on Cli::count_mem.
+const SUGGESTED_COUNT_MEM: f64 = 0.20;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1483,11 +1495,30 @@ fn main() -> Result<()> {
         .progress_chars("#>-"),
     );
 
-    let count_budget_bytes = (total_ram as f64 * cli.count_mem).max(256.0 * 1024.0 * 1024.0) as usize;
-    eprintln!(
-        "Counting memory budget: {:.2} GB (spills to disk beyond this).",
-        count_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
+    // --count-mem is only enforced when explicitly provided. When it is
+    // omitted, no counting-phase memory budget is applied: budget_bytes is
+    // set to usize::MAX so CountingIndex::maybe_spill() never trips based
+    // on RAM usage, and the counting phase always stays fully in memory
+    // (disk spilling can still happen at the final sort stage via
+    // --max-mem, which keeps its own enforced default).
+    let count_budget_bytes: usize = match cli.count_mem {
+        Some(frac) => {
+            let budget = (total_ram as f64 * frac).max(256.0 * 1024.0 * 1024.0) as usize;
+            eprintln!(
+                "Counting memory budget: {:.2} GB (spills to disk beyond this).",
+                budget as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+            budget
+        }
+        None => {
+            eprintln!(
+                "Counting memory budget: not set (--count-mem omitted) — no cap enforced; \
+                 suggested value if you want one is {:.2}.",
+                SUGGESTED_COUNT_MEM
+            );
+            usize::MAX
+        }
+    };
 
     let mut index = CountingIndex::new(count_budget_bytes, cli.temp_dir.clone(), pb.clone());
     let total_lines_acc = AtomicU64::new(0);
