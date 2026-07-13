@@ -2,6 +2,8 @@
 
 Fast, parallel tool for turning hashcat/john `.pot` files and plain wordlists into a deduplicated, optionally frequency-sorted password dictionary.
 
+[![pot2dict.jpg](https://i.postimg.cc/wvnfJkHZ/pot2dict.jpg)](https://postimg.cc/N97kvmKk)
+
 ## Features
 
 - Multithreaded counting (rayon) over mmap'd input, chunked at newline boundaries
