@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""
+pot2dict GUI — a desktop front end for the pot2dict binary.
+
+Builds the command line from the same options the Rust CLI exposes,
+runs it as a subprocess, and streams ONLY stderr (progress bar, spill
+warnings, final stats) live into a console pane. stdout is never
+captured into the log: when no --output path is set, the binary would
+write the actual password dictionary to stdout, and echoing that into
+a Tk Text widget would mean dumping the full plaintext password list
+into the GUI's log line-by-line. Instead this GUI always ensures an
+--output file path is set before launching, and discards the child's
+stdout stream entirely (it should carry nothing once -o is passed).
+
+Requires only the standard library (tkinter). Point "Binary path" at
+your compiled pot2dict release binary before running.
+"""
+
+import os
+import platform
+import shlex
+import subprocess
+import tempfile
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, font as tkfont
+
+# ---------------------------------------------------------------- palette --
+BG        = "#0a0c0e"
+PANEL     = "#101317"
+PANEL2    = "#14181d"
+LINE      = "#1f252b"
+TEXT      = "#d7dde2"
+MUTED     = "#6d7882"
+DIM       = "#454e56"
+AMBER     = "#e2a23b"
+AMBER_DIM = "#7a5a26"
+GREEN     = "#4fb478"
+RED       = "#d1594b"
+BLUE      = "#5b8fd6"
+
+MONO_FAMILY = "Consolas" if platform.system() == "Windows" else "Menlo" if platform.system() == "Darwin" else "DejaVu Sans Mono"
+SANS_FAMILY = "Segoe UI" if platform.system() == "Windows" else "Helvetica"
+
+
+def try_total_ram_gb():
+    try:
+        if platform.system() == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return kb / (1024 * 1024)
+        elif platform.system() == "Darwin":
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"])
+            return int(out.strip()) / (1024 ** 3)
+        elif platform.system() == "Windows":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullTotalPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return 16.0
+
+
+class Pill(tk.Label):
+    """A clickable pill-style toggle used for the sort-mode picker."""
+    def __init__(self, master, text, value, group, **kw):
+        super().__init__(master, text=text, font=(MONO_FAMILY, 10), padx=13, pady=6,
+                          bg=PANEL, fg=MUTED, cursor="hand2", **kw)
+        self.value = value
+        self.group = group
+        self.bind("<Button-1>", lambda e: group.select(self.value))
+
+    def set_on(self, on):
+        if on:
+            self.config(bg=AMBER, fg=BG, font=(MONO_FAMILY, 10, "bold"))
+        else:
+            self.config(bg=PANEL, fg=MUTED, font=(MONO_FAMILY, 10))
+
+
+class PillGroup:
+    def __init__(self, on_change):
+        self.pills = []
+        self.value = None
+        self.on_change = on_change
+
+    def add(self, pill):
+        self.pills.append(pill)
+
+    def select(self, value):
+        self.value = value
+        for p in self.pills:
+            p.set_on(p.value == value)
+        self.on_change()
+
+
+class Switch(tk.Canvas):
+    """A small on/off switch drawn on a canvas (tkinter has no native toggle)."""
+    def __init__(self, master, on_change, danger=False, **kw):
+        super().__init__(master, width=38, height=20, bg=PANEL, highlightthickness=0, cursor="hand2", **kw)
+        self.on = False
+        self.on_change = on_change
+        self.danger = danger
+        self.bind("<Button-1>", self.toggle)
+        self.draw()
+
+    def toggle(self, event=None):
+        self.on = not self.on
+        self.draw()
+        self.on_change()
+
+    def draw(self):
+        self.delete("all")
+        track = (AMBER_DIM if not self.danger else "#5a2a22") if self.on else LINE
+        knob = (AMBER if not self.danger else RED) if self.on else DIM
+        self.create_rectangle(0, 4, 38, 16, fill=track, outline="", width=0)
+        x = 22 if self.on else 4
+        self.create_oval(x, 2, x + 16, 18, fill=knob, outline=BG, width=2)
+
+
+class Checkbox(tk.Canvas):
+    """A small square checkbox drawn on a canvas — shows a clear filled
+    square + checkmark when marked, and an empty outlined square when not
+    marked (tk.Checkbutton's native look varies too much across platforms
+    to read reliably at a glance)."""
+    def __init__(self, master, on_toggle=None, checked=True, **kw):
+        super().__init__(master, width=18, height=18, bg=PANEL, highlightthickness=0, cursor="hand2", **kw)
+        self.checked = checked
+        self.on_toggle = on_toggle
+        self.bind("<Button-1>", self.toggle)
+        self.draw()
+
+    def toggle(self, event=None):
+        self.checked = not self.checked
+        self.draw()
+        if self.on_toggle:
+            self.on_toggle()
+
+    def set_checked(self, value):
+        self.checked = value
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        if self.checked:
+            self.create_rectangle(1, 1, 17, 17, fill=AMBER, outline=AMBER, width=1)
+            # checkmark
+            self.create_line(4, 9, 7.5, 13, 14, 4, fill=BG, width=2,
+                              capstyle="round", joinstyle="round")
+        else:
+            self.create_rectangle(1, 1, 17, 17, fill=PANEL, outline=DIM, width=1)
+
+
+class LabeledEntry(tk.Frame):
+    def __init__(self, master, label, flag, placeholder="", on_change=None, **kw):
+        super().__init__(master, bg=PANEL, **kw)
+        top = tk.Frame(self, bg=PANEL)
+        top.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(top, text=label, font=(MONO_FAMILY, 10), bg=PANEL, fg=MUTED).pack(side="left")
+        tk.Label(top, text=flag, font=(MONO_FAMILY, 9), bg=PANEL, fg=DIM).pack(side="right")
+        self.var = tk.StringVar()
+        self.entry = tk.Entry(self, textvariable=self.var, font=(MONO_FAMILY, 11), bg=BG, fg=TEXT,
+                               insertbackground=AMBER, relief="flat", highlightthickness=1,
+                               highlightbackground=LINE, highlightcolor=AMBER_DIM)
+        self.entry.pack(fill="x", padx=14, pady=(0, 12), ipady=5)
+        self.placeholder = placeholder
+        if on_change:
+            self.var.trace_add("write", lambda *_: on_change())
+
+    def get(self):
+        return self.var.get().strip()
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("pot2dict — run console")
+        self.configure(bg=BG)
+        self.geometry("1180x760")
+        self.minsize(920, 620)
+
+        self.ram_gb = try_total_ram_gb()
+        self.files = []
+        self.proc = None
+        self._built = False  # guards rebuild_command()/redraw_gauge() from firing
+                              # before all widgets referenced inside them exist
+
+        self._build_topbar()
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(0, weight=3)
+        body.grid_columnconfigure(1, weight=2)
+        body.grid_rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, bg=BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(20, 10), pady=16)
+        right = tk.Frame(body, bg=PANEL2, width=380)
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 20), pady=16)
+
+        self._build_left(left)
+        self._build_right(right)
+
+        self._built = True
+        self.rebuild_command()
+        self.update_ram_total()
+        self.update_mmap_status()
+
+    # ---------------------------------------------------------- top bar --
+    def _build_topbar(self):
+        bar = tk.Frame(self, bg=BG, height=52)
+        bar.pack(fill="x")
+        inner = tk.Frame(bar, bg=BG)
+        inner.pack(fill="x", padx=22, pady=12)
+        dot = tk.Canvas(inner, width=10, height=10, bg=BG, highlightthickness=0)
+        dot.create_oval(1, 1, 9, 9, fill=GREEN, outline="")
+        dot.pack(side="left", padx=(0, 10))
+        tk.Label(inner, text="pot2dict", font=(MONO_FAMILY, 14, "bold"), bg=BG, fg=TEXT).pack(side="left")
+        tk.Label(inner, text=" // run console", font=(MONO_FAMILY, 14), bg=BG, fg=AMBER).pack(side="left")
+        self.ramlabel = tk.Label(inner, text="", font=(MONO_FAMILY, 9), bg=BG, fg=DIM)
+        self.ramlabel.pack(side="right")
+        self.ramlabel.config(text=f"host RAM (detected) ≈ {self.ram_gb:.1f} GB")
+        tk.Frame(self, bg=LINE, height=1).pack(fill="x")
+
+    # ------------------------------------------------------------- left --
+    def _build_left(self, parent):
+        canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
+        scroll = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        frame = tk.Frame(canvas, bg=BG)
+        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=frame, anchor="nw", width=1)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        def on_resize(e):
+            canvas.itemconfig(1, width=e.width)
+        canvas.bind("<Configure>", on_resize)
+
+        def bind_wheel(widget):
+            widget.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+            widget.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            widget.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+        bind_wheel(canvas)
+        bind_wheel(frame)
+
+        # ---- binary path
+        self._section(frame, "00", "Binary")
+        binrow = tk.Frame(frame, bg=PANEL)
+        binrow.pack(fill="x", pady=(0, 20))
+        self.bin_var = tk.StringVar(value="./pot2dict")
+        e = tk.Entry(binrow, textvariable=self.bin_var, font=(MONO_FAMILY, 11), bg=BG, fg=TEXT,
+                     insertbackground=AMBER, relief="flat", highlightthickness=1,
+                     highlightbackground=LINE, highlightcolor=AMBER_DIM)
+        e.pack(side="left", fill="x", expand=True, padx=(14, 8), pady=12, ipady=5)
+        self.bin_var.trace_add("write", lambda *_: self.rebuild_command())
+        tk.Button(binrow, text="browse…", command=self.browse_binary, font=(MONO_FAMILY, 9),
+                  bg=PANEL, fg=AMBER, relief="flat", activebackground=LINE, cursor="hand2",
+                  highlightthickness=1, highlightbackground=AMBER_DIM).pack(side="right", padx=14)
+
+        # ---- input files
+        self._section(frame, "01", "Input files",
+                       "Pot files or plain wordlists — mmap'd + chunked, or streamed if .gz / .zst.")
+        self.filebox = tk.Frame(frame, bg=PANEL)
+        self.filebox.pack(fill="x", pady=(0, 8))
+        self.filelist_frame = tk.Frame(self.filebox, bg=PANEL)
+        self.filelist_frame.pack(fill="x", padx=14, pady=(12, 4))
+        tk.Button(self.filebox, text="+ add file", command=self.add_file_dialog, font=(MONO_FAMILY, 10),
+                  bg=PANEL, fg=AMBER, relief="flat", activebackground=LINE, cursor="hand2",
+                  highlightthickness=1, highlightbackground=AMBER_DIM).pack(anchor="w", padx=14, pady=(0, 12))
+
+        self.sw_parallel_files = self._switchrow(frame, "Process files in parallel",
+                                                  "Auto-enables above 100 input files regardless of this switch")
+
+        # ---- output
+        self._section(frame, "02", "Output",
+                       "Required by this GUI. If left blank, a default output file is auto-generated when you hit "
+                       "Run — the dictionary is never streamed through the log console, since that would mean "
+                       "printing every recovered password into this window.")
+        self.output_entry = LabeledEntry(frame, "Output path", "-o / --output", on_change=self.rebuild_command)
+        self.output_entry.pack(fill="x", pady=(0, 10))
+        self.tempdir_entry = LabeledEntry(frame, "Temp / spill directory", "--temp-dir", on_change=self.rebuild_command)
+        self.tempdir_entry.pack(fill="x", pady=(0, 10))
+        self.sw_mmap = self._switchrow(frame, "Write final output via mmap",
+                                        "--mmap-output — only used above 10 GB output, under 100M records")
+        self.mmap_status = tk.Label(frame, text="", font=(MONO_FAMILY, 9), bg=BG, fg=DIM,
+                                     anchor="w", justify="left", wraplength=560)
+        self.mmap_status.pack(fill="x", pady=(0, 20), anchor="w")
+
+        # ---- sort mode
+        self._section(frame, "03", "Sort mode",
+                       "Frequency ranks by occurrence count. Unique just dedupes and can stream-merge.")
+        pillrow = tk.Frame(frame, bg=BG)
+        pillrow.pack(fill="x", pady=(0, 20))
+        self.mode_group = PillGroup(self.rebuild_command)
+        for label, val in [("--freq (by frequency)", "freq"), ("--unique (dedupe only)", "unique")]:
+            p = Pill(pillrow, label, val, self.mode_group)
+            p.pack(side="left", padx=(0, 8))
+            self.mode_group.add(p)
+        self.mode_group.select("freq")
+
+        # ---- parsing
+        self._section(frame, "04", "Line parsing")
+        self.sw_trailing = self._switchrow(frame, "Keep trailing-colon lines",
+                                            "--keep-trailing-colon — count \"hash:\" instead of discarding it")
+
+        # ---- memory
+        self._section(frame, "05", "Memory budgets",
+                       "Fractions of total host RAM. --max-mem is always enforced (default 0.50) and spills the "
+                       "final sort. --count-mem is opt-in (suggested 0.20) — uncheck it to run the counting stage "
+                       "with no memory cap at all.")
+        self.countmem = self._slider(frame, "Counting-stage budget", "--count-mem", 0.20, toggleable=True)
+        self.maxmem = self._slider(frame, "Sort-stage budget", "--max-mem", 0.50)
+        self.gauge = tk.Canvas(frame, height=10, bg=BG, highlightthickness=1, highlightbackground=LINE)
+        self.gauge.pack(fill="x", pady=(4, 4))
+        legend = tk.Frame(frame, bg=BG)
+        legend.pack(fill="x", pady=(0, 20))
+        tk.Label(legend, text="■ counting", font=(MONO_FAMILY, 9), bg=BG, fg=AMBER).pack(side="left", padx=(0, 12))
+        tk.Label(legend, text="■ sort", font=(MONO_FAMILY, 9), bg=BG, fg=BLUE).pack(side="left", padx=(0, 12))
+        tk.Label(legend, text="■ headroom", font=(MONO_FAMILY, 9), bg=BG, fg=DIM).pack(side="left")
+
+        self.ram_total_label = tk.Label(frame, text="", font=(MONO_FAMILY, 10, "bold"), bg=BG, fg=TEXT,
+                                         anchor="w", justify="left")
+        self.ram_total_label.pack(fill="x", pady=(2, 20))
+
+        # ---- concurrency
+        self._section(frame, "06", "Concurrency")
+        self.processes_entry = LabeledEntry(frame, "Worker threads", "-p / --processes", on_change=self.rebuild_command)
+        self.processes_entry.pack(fill="x", pady=(0, 10))
+        self.chunkbatch_entry = LabeledEntry(frame, "Chunk batch size", "--chunk-batch-size", on_change=self.rebuild_command)
+        self.chunkbatch_entry.pack(fill="x", pady=(0, 10))
+
+        # ---- advanced
+        self._section(frame, "07", "Advanced",
+                       "Arena mode skips a per-key allocation but never frees — grows for the life of the run.")
+        self.sw_arena = self._switchrow(frame, "Arena allocator", "--arena", danger=True)
+        self.arena_warn = tk.Label(frame, text="⚠ arena buffers grow forever and are never freed — risk of OOM on large low-duplication inputs.",
+                                    font=(MONO_FAMILY, 9), bg=BG, fg=RED, wraplength=560, justify="left")
+        self.arena_warn.pack(fill="x", pady=(0, 30), anchor="w")
+        self.arena_warn.pack_forget()
+
+    def _section(self, parent, idx, title, desc=None):
+        head = tk.Frame(parent, bg=BG)
+        head.pack(fill="x", anchor="w", pady=(6, 2))
+        tk.Label(head, text=idx, font=(MONO_FAMILY, 10), bg=BG, fg=AMBER_DIM).pack(side="left")
+        tk.Label(head, text="  " + title, font=(MONO_FAMILY, 13, "bold"), bg=BG, fg=TEXT).pack(side="left")
+        if desc:
+            tk.Label(parent, text=desc, font=(SANS_FAMILY, 9), bg=BG, fg=MUTED, wraplength=560,
+                      justify="left").pack(anchor="w", pady=(2, 10))
+        else:
+            tk.Frame(parent, bg=BG, height=6).pack()
+
+    def _switchrow(self, parent, label, sub, danger=False):
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(fill="x", pady=(0, 10))
+        textf = tk.Frame(row, bg=PANEL)
+        textf.pack(side="left", fill="x", expand=True, padx=14, pady=10)
+        tk.Label(textf, text=label, font=(MONO_FAMILY, 11), bg=PANEL, fg=TEXT, anchor="w").pack(fill="x")
+        tk.Label(textf, text=sub, font=(SANS_FAMILY, 9), bg=PANEL, fg=DIM, anchor="w", wraplength=420,
+                  justify="left").pack(fill="x")
+        sw = Switch(row, on_change=self._on_switch_change, danger=danger)
+        sw.pack(side="right", padx=14)
+        return sw
+
+    def _on_switch_change(self):
+        self.arena_warn.pack(fill="x", pady=(0, 30), anchor="w") if self.sw_arena.on else self.arena_warn.pack_forget()
+        self.rebuild_command()
+        self.update_mmap_status()
+
+    def _slider(self, parent, label, flag, default, toggleable=False):
+        box = tk.Frame(parent, bg=PANEL)
+        box.pack(fill="x", pady=(0, 12))
+        top = tk.Frame(box, bg=PANEL)
+        top.pack(fill="x", padx=14, pady=(12, 4))
+
+        enabled_var = tk.BooleanVar(value=True)
+        label_widget = tk.Label(top, text=label, font=(MONO_FAMILY, 10), bg=PANEL, fg=MUTED)
+
+        if toggleable:
+            def on_check_toggle():
+                enabled_var.set(chk.checked)
+                changed()
+            chk = Checkbox(top, on_toggle=on_check_toggle, checked=True)
+            chk.pack(side="left", padx=(0, 8))
+        label_widget.pack(side="left")
+
+        tk.Label(top, text=flag, font=(MONO_FAMILY, 9), bg=PANEL, fg=DIM).pack(side="right", padx=(0, 6))
+        valuelabel = tk.Label(top, text=f"{default:.2f}", font=(MONO_FAMILY, 10, "bold"), bg=PANEL, fg=AMBER)
+        valuelabel.pack(side="right")
+
+        var = tk.DoubleVar(value=default)
+        scale = tk.Scale(box, from_=0.05, to=0.9, resolution=0.01, orient="horizontal", variable=var,
+                          bg=PANEL, fg=TEXT, troughcolor=LINE, highlightthickness=0, showvalue=False,
+                          sliderrelief="flat", activebackground=AMBER, bd=0)
+        scale.pack(fill="x", padx=14, pady=(0, 4))
+        hint = tk.Label(box, text="", font=(MONO_FAMILY, 9), bg=PANEL, fg=DIM)
+        hint.pack(anchor="w", padx=14, pady=(0, 12))
+
+        def changed(*_):
+            on = enabled_var.get()
+            state = "normal" if on else "disabled"
+            scale.config(state=state)
+            fg = TEXT if on else DIM
+            valuelabel.config(text=f"{var.get():.2f}" if on else "unset", fg=AMBER if on else DIM)
+            label_widget.config(fg=MUTED if on else DIM)
+            if on:
+                hint.config(text=f"≈ {max(0.25, self.ram_gb * var.get()):.2f} GB estimated RAM usage")
+            else:
+                if flag == "--count-mem":
+                    hint.config(text="flag omitted — no counting-stage memory cap is enforced at all "
+                                      "(counting stage stays fully in memory, no RAM-based spill)")
+                else:
+                    hint.config(text=f"flag omitted — binary falls back to its own default for {flag}")
+            self.rebuild_command()
+            self.redraw_gauge()
+            self.update_ram_total()
+            self.update_mmap_status()
+
+        var.trace_add("write", changed)
+        changed()
+        var.enabled_var = enabled_var  # stash so build_args() can check it without a second return value
+        return var
+
+    def update_ram_total(self):
+        if not hasattr(self, "ram_total_label"):
+            return
+        count_enabled = getattr(self.countmem, "enabled_var", None) is None or self.countmem.enabled_var.get()
+        sort_gb = self.ram_gb * self.maxmem.get()
+
+        if count_enabled:
+            count_gb = max(0.25, self.ram_gb * self.countmem.get())
+            total_gb = count_gb + sort_gb
+            pct = (total_gb / self.ram_gb) * 100 if self.ram_gb else 0
+            color = RED if pct > 100 else AMBER if pct > 75 else TEXT
+            self.ram_total_label.config(
+                text=f"Total ≈ {total_gb:.2f} GB ({pct:.0f}% of {self.ram_gb:.1f} GB RAM) — "
+                     f"counting {count_gb:.2f} GB + sorting {sort_gb:.2f} GB",
+                fg=color,
+            )
+        else:
+            self.ram_total_label.config(
+                text=f"Counting stage: no cap enforced (--count-mem omitted)  •  "
+                     f"sorting budget only: ≈ {sort_gb:.2f} GB ({(sort_gb / self.ram_gb * 100 if self.ram_gb else 0):.0f}% of RAM)",
+                fg=AMBER,
+            )
+
+    def update_mmap_status(self):
+        if not hasattr(self, "mmap_status"):
+            return
+
+        if not self.sw_mmap.on:
+            self.mmap_status.config(
+                text="--mmap-output is off — writer will always use the buffered path.",
+                fg=DIM,
+            )
+            return
+
+        MMAP_THRESHOLD_GB = 10.0
+        files = self.collect_files()
+        input_bytes = 0
+        missing = False
+        for f in files:
+            try:
+                input_bytes += os.path.getsize(f)
+            except OSError:
+                missing = True
+        input_gb = input_bytes / (1024 ** 3)
+
+        # Rough proxy only: real trigger is *unique-password* output size,
+        # which is always <= raw input size and usually far smaller once
+        # duplicates are collapsed. This can't be known without running the
+        # count, so treat input size as an upper bound on the estimate.
+        count_enabled = getattr(self.countmem, "enabled_var", None) is None or self.countmem.enabled_var.get()
+        if count_enabled:
+            count_budget_gb = max(0.25, self.ram_gb * self.countmem.get())
+            likely_spills = input_gb > count_budget_gb * 1.5  # heuristic margin
+        else:
+            # --count-mem omitted → no counting-stage cap at all, so the
+            # counting stage itself will never force a spill regardless of
+            # input size (though the final sort can still spill via --max-mem).
+            likely_spills = False
+
+        lines = [f"Input size (upper bound on output): ≈ {input_gb:.2f} GB" + (" (some files unreadable)" if missing else "")]
+
+        if likely_spills:
+            lines.append("Counting stage will likely spill to disk given --count-mem — "
+                          "mmap output is skipped entirely on the spilled path, regardless of size.")
+            color = RED
+        elif input_gb <= MMAP_THRESHOLD_GB:
+            lines.append(f"Below the {MMAP_THRESHOLD_GB:.0f} GB mmap threshold — buffered writer will be used, not mmap.")
+            color = DIM
+        else:
+            lines.append(f"Above the {MMAP_THRESHOLD_GB:.0f} GB threshold and under 100M records → mmap path likely engages "
+                          "(if it also fits within --max-mem).")
+            color = GREEN
+
+        self.mmap_status.config(text="  •  ".join(lines), fg=color)
+
+    def redraw_gauge(self):
+        if not hasattr(self, "gauge"):
+            return
+        self.gauge.delete("all")
+        w = self.gauge.winfo_width() or 560
+        c = min(self.countmem.get(), 1.0) * w
+        s = min(self.maxmem.get(), 1.0) * w
+        self.gauge.create_rectangle(0, 0, c, 10, fill=AMBER, outline="")
+        self.gauge.create_rectangle(c, 0, c + s, 10, fill=BLUE, outline="")
+
+    def browse_binary(self):
+        path = filedialog.askopenfilename(title="Select pot2dict binary")
+        if path:
+            self.bin_var.set(path)
+
+    def add_file_dialog(self):
+        paths = filedialog.askopenfilenames(title="Select input file(s)")
+        for p in paths:
+            self._add_file_row(p)
+        self.rebuild_command()
+        self.update_mmap_status()
+
+    def _add_file_row(self, path=""):
+        row = tk.Frame(self.filelist_frame, bg=PANEL)
+        row.pack(fill="x", pady=3)
+        var = tk.StringVar(value=path)
+        ent = tk.Entry(row, textvariable=var, font=(MONO_FAMILY, 10), bg=BG, fg=TEXT,
+                        insertbackground=AMBER, relief="flat", highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=AMBER_DIM)
+        ent.pack(side="left", fill="x", expand=True, ipady=4)
+        var.trace_add("write", lambda *_: (self.rebuild_command(), self.update_mmap_status()))
+        rm = tk.Button(row, text="✕", command=lambda: (row.destroy(), self.rebuild_command(), self.update_mmap_status()),
+                        font=(MONO_FAMILY, 9), bg=PANEL, fg=DIM, relief="flat", cursor="hand2",
+                        activeforeground=RED)
+        rm.pack(side="right", padx=(6, 0))
+
+    # ------------------------------------------------------------ right --
+    def _build_right(self, parent):
+        tk.Label(parent, text="COMMAND", font=(MONO_FAMILY, 9), bg=PANEL2, fg=DIM).pack(anchor="w", padx=18, pady=(18, 6))
+
+        self.cmdbox = tk.Text(parent, height=8, bg="#000000", fg=GREEN, font=(MONO_FAMILY, 10),
+                               relief="flat", wrap="word", highlightthickness=1, highlightbackground=LINE,
+                               padx=10, pady=10)
+        self.cmdbox.pack(fill="x", padx=18)
+        self.cmdbox.config(state="disabled")
+
+        btnrow = tk.Frame(parent, bg=PANEL2)
+        btnrow.pack(fill="x", padx=18, pady=10)
+        self.run_btn = tk.Button(btnrow, text="▶ run", command=self.run_command, font=(MONO_FAMILY, 10, "bold"),
+                                  bg=AMBER, fg=BG, relief="flat", cursor="hand2", activebackground="#f0b455")
+        self.run_btn.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 6))
+        self.copy_btn = tk.Button(btnrow, text="copy", command=self.copy_command, font=(MONO_FAMILY, 10),
+                                   bg=PANEL2, fg=AMBER, relief="flat", cursor="hand2",
+                                   highlightthickness=1, highlightbackground=AMBER_DIM)
+        self.copy_btn.pack(side="left", ipady=6, padx=(6, 0))
+
+        tk.Label(parent, text="LIVE OUTPUT", font=(MONO_FAMILY, 9), bg=PANEL2, fg=DIM).pack(anchor="w", padx=18, pady=(10, 6))
+        outframe = tk.Frame(parent, bg=PANEL2)
+        outframe.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+        self.output_text = tk.Text(outframe, bg="#000000", fg=TEXT, font=(MONO_FAMILY, 9),
+                                    relief="flat", wrap="word", highlightthickness=1, highlightbackground=LINE,
+                                    padx=8, pady=8)
+        sb = tk.Scrollbar(outframe, command=self.output_text.yview)
+        self.output_text.configure(yscrollcommand=sb.set)
+        self.output_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.output_text.tag_config("warn", foreground=RED)
+        self.output_text.tag_config("ok", foreground=GREEN)
+
+        self.status_label = tk.Label(parent, text="idle", font=(MONO_FAMILY, 9), bg=PANEL2, fg=DIM)
+        self.status_label.pack(anchor="w", padx=18, pady=(0, 16))
+
+    # -------------------------------------------------------- build cmd --
+    def collect_files(self):
+        files = []
+        for row in self.filelist_frame.winfo_children():
+            for w in row.winfo_children():
+                if isinstance(w, tk.Entry):
+                    val = w.get().strip()
+                    if val:
+                        files.append(val)
+        return files
+
+    def build_args(self):
+        args = [self.bin_var.get().strip() or "./pot2dict"]
+        args += self.collect_files()
+        out = self.output_entry.get()
+        if out:
+            args += ["-o", out]
+        mode = self.mode_group.value
+        if mode == "freq":
+            args.append("--freq")
+        elif mode == "unique":
+            args.append("--unique")
+        procs = self.processes_entry.get()
+        if procs:
+            args += ["-p", procs]
+        chunk = self.chunkbatch_entry.get()
+        if chunk:
+            args += ["--chunk-batch-size", chunk]
+        if getattr(self.countmem, "enabled_var", None) is None or self.countmem.enabled_var.get():
+            args += ["--count-mem", f"{self.countmem.get():.2f}"]
+        args += ["--max-mem", f"{self.maxmem.get():.2f}"]
+        tempdir = self.tempdir_entry.get()
+        if tempdir:
+            args += ["--temp-dir", tempdir]
+        if self.sw_trailing.on:
+            args.append("--keep-trailing-colon")
+        if self.sw_arena.on:
+            args.append("--arena")
+        if self.sw_mmap.on:
+            args.append("--mmap-output")
+        if self.sw_parallel_files.on:
+            args.append("--parallel-files")
+        return args
+
+    def rebuild_command(self):
+        if not self._built:
+            return
+        args = self.build_args()
+        text = " \\\n  ".join(shlex.quote(a) for a in args)
+        self.cmdbox.config(state="normal")
+        self.cmdbox.delete("1.0", "end")
+        self.cmdbox.insert("1.0", text)
+        self.cmdbox.config(state="disabled")
+        self.redraw_gauge()
+
+    def copy_command(self):
+        args = self.build_args()
+        text = " ".join(shlex.quote(a) for a in args)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.copy_btn.config(text="copied ✓", fg=GREEN)
+        self.after(1500, lambda: self.copy_btn.config(text="copy", fg=AMBER))
+
+    # -------------------------------------------------------------- run --
+    def ensure_output_path(self):
+        """Guarantee an --output path is set before launching. Without one,
+        the binary would write the actual password dictionary to stdout,
+        and this GUI would have to choose between dropping that stream on
+        the floor (silent data loss for the user) or echoing it into the
+        log console — which would mean printing every recovered password
+        into a Tk Text widget line by line. Neither is acceptable, so a
+        default path is generated instead and the field is filled in so
+        the user can see and change it before running."""
+        out = self.output_entry.get()
+        if out:
+            return out
+        default_dir = tempfile.gettempdir()
+        default_name = f"pot2dict_output_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        default_path = os.path.join(default_dir, default_name)
+        self.output_entry.var.set(default_path)
+        self.append_output(f"[no output path set — defaulting to {default_path}]\n")
+        return default_path
+
+    def run_command(self):
+        if self.proc is not None:
+            self.append_output("\n[already running — one job at a time]\n", "warn")
+            return
+
+        self.output_text.delete("1.0", "end")
+        self.ensure_output_path()  # must run before build_args() picks up -o
+        args = self.build_args()
+        if len(args) < 2:
+            self.append_output("[no input files specified]\n", "warn")
+            return
+
+        self.append_output("$ " + " ".join(shlex.quote(a) for a in args) + "\n\n")
+        self.status_label.config(text="running…", fg=AMBER)
+        self.run_btn.config(text="■ stop", command=self.stop_command, bg=RED)
+
+        def worker():
+            try:
+                # stdout is intentionally NOT piped: with --output always
+                # set (see ensure_output_path), the binary writes the
+                # dictionary straight to disk and shouldn't emit password
+                # data on stdout at all — but stdout is discarded rather
+                # than captured regardless, as a hard guarantee that raw
+                # password lines can never end up in this log widget.
+                # stderr carries only the progress bar, spill warnings,
+                # and the final summary stats, so only stderr is streamed.
+                self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                              text=True, bufsize=1)
+                for line in self.proc.stderr:
+                    tag = "warn" if ("warn" in line.lower() or "error" in line.lower()) else None
+                    self.append_output(line, tag)
+                self.proc.wait()
+                code = self.proc.returncode
+                self.append_output(f"\n[process exited with code {code}]\n", "ok" if code == 0 else "warn")
+            except FileNotFoundError:
+                self.append_output(f"\n[binary not found: {args[0]} — set the correct path above]\n", "warn")
+            except Exception as e:
+                self.append_output(f"\n[error launching process: {e}]\n", "warn")
+            finally:
+                self.proc = None
+                self.status_label.config(text="idle", fg=DIM)
+                self.run_btn.config(text="▶ run", command=self.run_command, bg=AMBER)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def stop_command(self):
+        if self.proc is not None:
+            self.proc.terminate()
+            self.append_output("\n[terminated by user]\n", "warn")
+
+    def append_output(self, text, tag=None):
+        self.output_text.insert("end", text, tag)
+        self.output_text.see("end")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.after(50, app._add_file_row, "hashes.pot")
+    app.mainloop()
