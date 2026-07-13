@@ -31,12 +31,6 @@ This is a deliberate tradeoff. Tools that keep everything in memory (`awk '!seen
 
 Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three large plain-text wordlists (~21 GB combined) with a tight counting budget:
 
-```bash
-time ./pot2dict wordlist_a.txt wordlist_b.txt wordlist_c.txt \
-  -p 12 --unique --keep-trailing-colon -o merged.txt \
-  --temp-dir /mnt/data/tmp \
-  --count-mem 0.20 --chunk-batch-size 2 --mmap-output
-```
 
 | Stat                     | Value                            |
 | ------------------------ | -------------------------------- |
