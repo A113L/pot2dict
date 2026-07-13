@@ -5,7 +5,6 @@ Fast, parallel tool for turning hashcat/john `.pot` files and plain wordlists in
 ## Features
 
 - Multithreaded counting (rayon) over mmap'd input, chunked at newline boundaries
-- Gzip (`.gz`) and Zstandard (`.zst`) input support, decompressed and counted in parallel
 - `DashMap`-backed global counter — sharded, so many small input files scale without lock contention
 - Optional persistent bump-arena key allocation (`--arena`) for very large unique-password sets (~50M+)
 - Automatic spill-to-disk during counting when the working set exceeds your counting memory budget, with streaming external merge on read-back
