@@ -78,7 +78,7 @@ pot2dict input1.pot input2.txt.gz input3.txt.zst -o dict.txt --freq
 | `--freq` | Sort by frequency (most common first) |
 | `--unique` | Sort alphabetically, dedup only |
 | `--max-mem <FRACTION>` | Fraction of system RAM usable for in-memory/output sort (default: 0.5) |
-| `--count-mem <FRACTION>` | Fraction of system RAM usable as the counting-phase working-set budget before spilling to disk (default: 0.3, minimum 256 MB) |
+| `--count-mem <FRACTION>` | Fraction of system RAM usable as the counting-phase working-set budget before spilling to disk (default: 0.2, minimum 256 MB) - optional |
 | `--chunk-batch-size <N>` | Number of mmap'd input chunks processed per batch before checking whether to spill (default: number of threads) |
 | `--temp-dir <DIR>` | Directory for spill files during counting and external sort |
 | `--keep-trailing-colon` | Treat a line ending in a bare `:` as the literal password instead of skipping it |
