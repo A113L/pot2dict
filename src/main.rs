@@ -485,10 +485,27 @@ impl CountingIndex {
             spilled_runs.push(temp_path);
         }
 
+        let spilled_run_count = spilled_runs.len();
         eprintln!(
             "Merging {} spilled counting runs from disk...",
-            spilled_runs.len()
+            spilled_run_count
         );
+
+        // Parallel pre-pass: fan the N spilled runs out across cores,
+        // merging+deduping groups of them concurrently, before handing the
+        // (much smaller) result to the existing single-threaded merge. This
+        // is what actually parallelizes "Merging N spilled counting runs
+        // from disk..." -- without it that phase is a single thread walking
+        // all N runs with one heap.
+        let spilled_runs = parallel_merge_counting_runs(spilled_runs, &self.temp_dir)?;
+        if spilled_runs.len() != spilled_run_count {
+            eprintln!(
+                "Parallel pre-merge done: {} runs -> {} runs; finishing merge...",
+                spilled_run_count,
+                spilled_runs.len()
+            );
+        }
+
         Ok(FinalizedResult::Spilled {
             runs: spilled_runs,
             sort_mode: sort_mode.to_string(),
@@ -555,6 +572,155 @@ fn fold_into_dashmap_arena(index: &CountingIndex, local: FastMap<&'static [u8], 
             }
         }
     }
+}
+
+/// Merges one group of sorted, spilled counting runs (same on-disk format as
+/// produced by write_entries_to_temp: key = raw positive count, entries
+/// sorted by password) into a single new sorted+deduped run. This is the
+/// same heap-merge logic used by the final sequential merge, just scoped to
+/// a subset of runs so it can be run concurrently with other groups.
+fn merge_dedup_group(
+    paths: &[tempfile::TempPath],
+    temp_dir: &Option<PathBuf>,
+) -> Result<tempfile::TempPath> {
+    struct HeapEntry {
+        pw: Vec<u8>,
+        count: u64,
+        idx: usize,
+    }
+    impl PartialEq for HeapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.pw == other.pw
+        }
+    }
+    impl Eq for HeapEntry {}
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other.pw.cmp(&self.pw)
+        }
+    }
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut readers: Vec<BufReader<File>> = paths
+        .iter()
+        .map(|p| -> Result<BufReader<File>> {
+            Ok(BufReader::with_capacity(4 * 1024 * 1024, File::open(p)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(readers.len());
+    for (idx, r) in readers.iter_mut().enumerate() {
+        if let Some(rec) = read_record(r)? {
+            heap.push(HeapEntry {
+                pw: rec.pw,
+                count: rec.key as u64,
+                idx,
+            });
+        }
+    }
+
+    let temp = if let Some(dir) = temp_dir {
+        NamedTempFile::new_in(dir)?
+    } else {
+        NamedTempFile::new()?
+    };
+    {
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, &temp);
+        while let Some(HeapEntry { pw, count, idx }) = heap.pop() {
+            let mut total = count;
+            if let Some(next) = read_record(&mut readers[idx])? {
+                heap.push(HeapEntry {
+                    pw: next.pw,
+                    count: next.key as u64,
+                    idx,
+                });
+            }
+            while let Some(top) = heap.peek() {
+                if top.pw != pw {
+                    break;
+                }
+                let HeapEntry {
+                    count: c2,
+                    idx: idx2,
+                    ..
+                } = heap.pop().unwrap();
+                total += c2;
+                if let Some(next2) = read_record(&mut readers[idx2])? {
+                    heap.push(HeapEntry {
+                        pw: next2.pw,
+                        count: next2.key as u64,
+                        idx: idx2,
+                    });
+                }
+            }
+            // Keep the same key convention as write_entries_to_temp with
+            // negate_key=false: key is the raw (positive) merged count.
+            write_record(&mut writer, &Record { key: total as i64, pw })?;
+        }
+        writer.flush()?;
+    }
+    Ok(temp.into_temp_path())
+}
+
+/// Parallel merge-tree pre-pass: instead of one thread walking all N spilled
+/// runs with a single heap, split the runs into ~num_threads groups, merge
+/// each group (dedup + sum counts) concurrently on separate cores, and
+/// return the much smaller set of intermediate runs. The existing
+/// single-threaded merge (stream_merge_and_write / external_sort_spilled_runs)
+/// then only has to walk that small set, so the expensive O(N) fan-in work
+/// is parallelized while the final merge stays simple and correct.
+///
+/// Takes ownership of `runs` because each group's input files are consumed
+/// (read once, then dropped/deleted) as soon as its intermediate run is
+/// produced, which also keeps peak temp-disk usage down.
+fn parallel_merge_counting_runs(
+    runs: Vec<tempfile::TempPath>,
+    temp_dir: &Option<PathBuf>,
+) -> Result<Vec<tempfile::TempPath>> {
+    let num_threads = rayon::current_num_threads().max(1);
+
+    // Not enough runs for grouping to help (each group needs >=2 runs to
+    // actually reduce anything), or only one core available: skip the
+    // pre-pass and let the caller's sequential merge handle it directly.
+    if num_threads <= 1 || runs.len() < num_threads * 2 {
+        return Ok(runs);
+    }
+
+    let group_size = ((runs.len() + num_threads - 1) / num_threads).max(2);
+
+    let mut groups: Vec<Vec<tempfile::TempPath>> = Vec::new();
+    let mut iter = runs.into_iter();
+    loop {
+        let group: Vec<_> = iter.by_ref().take(group_size).collect();
+        if group.is_empty() {
+            break;
+        }
+        groups.push(group);
+    }
+
+    if groups.len() <= 1 {
+        // Only formed a single group; flatten it back out, nothing to
+        // parallelize.
+        return Ok(groups.into_iter().flatten().collect());
+    }
+
+    eprintln!(
+        "Parallel pre-merge: {} runs -> {} groups across up to {} threads...",
+        groups.iter().map(|g| g.len()).sum::<usize>(),
+        groups.len(),
+        num_threads
+    );
+
+    let merged: Vec<tempfile::TempPath> = groups
+        .into_par_iter()
+        .map(|g| merge_dedup_group(&g, temp_dir))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(merged)
 }
 
 fn stream_merge_and_write(
