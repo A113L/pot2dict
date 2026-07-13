@@ -29,24 +29,21 @@ This is a deliberate tradeoff. Tools that keep everything in memory (`awk '!seen
 
 ## Example run (low-RAM, spill-heavy)
 
-Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three large plain-text wordlists (~21 GB combined) with a tight counting budget:
+Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three runs on large plain-text wordlists with a tight counting budget:
 
 
-| Stat                     | Value                            |
-| ------------------------ | -------------------------------- |
-| **System RAM**           | 8 GB                             |
-| **Total Input Size**     | 21.16 GiB (2.6× RAM)             |
-| **Files Processed**      | 3                                |
-| **Total Lines**          | 1,746,922,348 (~1.75B)           |
-| **Unique Passwords**     | 1,451,675,930 (~1.45B)           |
-| **Duplication Rate**     | 16.9%                            |
-| **Threads**              | 12                                |
-| **Count Memory Budget**  | 1.53 GB (19% of RAM)             |
-| **Max Memory Budget**    | ~4 GB (50% of RAM, default)      |
-| **Chunk Batch Size**     | 2                                 |
-| **Temp Directory**       | `/mnt/data/tmp` (163.73 GB free) |
-| **Spill Runs Created**   | 61                                |
-| **Peak Temp Space Used** | ~93 GB (estimated)               |
+| Metric                | Run 1 (21.16 GB) | Run 2 (8.93 GB) | Run 3 (3.39 GB) | Trend           |
+| --------------------- | ---------------- | --------------- | --------------- | --------------- |
+| **Input Size**        | 21.16 GiB        | 8.93 GiB        | 3.39 GiB        | —               |
+| **Input : RAM Ratio** | 2.6×             | 1.1×            | **0.42×**       | ↓ Less pressure |
+| **Total Lines**       | 1.75B            | 838M            | 329M            | —               |
+| **Unique Lines**      | 1.45B            | 514M            | 253M            | —               |
+| **Duplication Rate**  | 16.9%            | **38.6%**       | 23.0%           | —               |
+| **Spill Runs**        | 61               | 29              | **10**          | ↓ Fewer spills  |
+| **Wall Time**         | 106m 15s         | 51m 37s         | **18m 4s**      | ↓ Sub-linear    |
+| **Lines/Second**      | 273,700          | 270,700         | **303,100**     | ↑ Faster!       |
+| **MB/Second**         | 3.3              | 2.9             | **3.2**         | Stable          |
+
 
 
 ## Install
