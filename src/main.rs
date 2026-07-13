@@ -276,13 +276,12 @@ impl CountingIndex {
                     ensure_disk_space(&spill_dir, approx_bytes, "counting-phase spill")?;
 
                     let mut entries = job.entries;
-                    // NOTE: intentionally NOT par_sort_unstable_by here. This
-                    // closure runs on its own dedicated std::thread
-                    // ("spill-writer"), separate from the rayon pool, and
-                    // rayon's parallel sort needs idle rayon worker threads
-                    // to offload work onto. A sequential sort has no such
-                    // dependency and can't stall waiting for pool workers.
-                    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    // Safe to use the parallel sort here: now that
+                    // compressed-file support is gone, nothing in this
+                    // program permanently pins every rayon worker thread
+                    // (read_file's mmap batches release the pool between
+                    // batches), so this can freely use all CPU cores.
+                    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
                     let temp_path = write_entries_to_temp(&entries, &writer_temp_dir, false)?;
                     writer_runs.lock().push(temp_path);
@@ -1047,13 +1046,11 @@ fn write_entries_to_temp(
         let mut mmap = unsafe { MmapMut::map_mut(file)? };
         let base = SyncMmapMut(mmap.as_mut_ptr(), mmap.len());
 
-        // NOTE: intentionally NOT par_iter() here, for the same reason as
-        // the sort in the spill-writer thread (see CountingIndex::new):
-        // this closure runs on a dedicated std::thread outside the rayon
-        // pool, so a rayon parallel iterator here could queue work-stealing
-        // jobs with no idle worker guaranteed to pick them up. A plain
-        // sequential loop has no such dependency.
-        entries.iter().enumerate().for_each(|(i, (pw, count))| {
+        // Safe to use par_iter() here: nothing in this program permanently
+        // pins every rayon worker thread anymore (compressed-file support,
+        // which used to do that, has been removed), so this parallel copy
+        // can freely use all CPU cores for maximum spill-write throughput.
+        entries.par_iter().enumerate().for_each(|(i, (pw, count))| {
             let start = offsets[i];
             debug_assert_eq!(offsets[i + 1] - start, record_encoded_len(pw.len()));
             let key: i64 = if negate_key {
