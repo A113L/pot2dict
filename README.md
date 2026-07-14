@@ -114,7 +114,7 @@ Both spill paths write to `--temp-dir` if given, otherwise the system temp direc
 
 ## Example run (low-RAM, spill-heavy)
 
-Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging three runs on large plain-text wordlists with a tight counting budget (--count-mem=0.2):
+Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging four runs on large plain-text wordlists with a tight counting budget (--count-mem=0.2):
 
 | Metric                        | Run 1 (44.85 GB) | Run 2 (21.16 GB) | Run 3 (8.93 GB) | Run 4 (3.39 GB) | Trend           |
 | ----------------------------- | ---------------- | ---------------- | --------------- | --------------- | --------------- |
