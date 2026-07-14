@@ -138,7 +138,7 @@ Real-world run on a memory-constrained machine (8 GB RAM, 12 threads), merging f
 | :----------------------- | :---------------------------------------------------------------------------- | :---------- | :---------------- | :--------- | :----- | :---------------- | :--------------- |
 | **pot2dict**             | `./pot2dict [7 files] -o wordlist.txt --unique -p 8 --max-mem 0.50` | 38.950s     | 0.36×             | 78,571,277 | 74.62% | 8 threads         | `--max-mem 0.50` |
 | **sort -u** (GNU)        | `LC_ALL=C sort -S 50% --parallel=8 -u [7 files] > wordlist.txt`                              | **14.194s** | **baseline**      | 78,571,277 | 74.62% | 8 threads         | `-S 50%`         |
-| **HK Merge Tool** (Mono) | `mono App.Merge.exe o="wordlist.txt" t=8 c=7 [7 files]`             | 58.681s     | 0.24×             | 78,571,277 | 74.62% | 8 threads (`t=8`) | `c=7`            |
+| **HK Merge Tool** (Mono) | `mono App.Merge.exe o="wordlist.txt" t=8 c=7 [7 files]`             | 58.681s     | 0.24×             | 78,571,277 | 74.62% | 8 threads (`t=8`) | `c=8`            |
 
 
 
