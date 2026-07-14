@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -257,6 +257,51 @@ fn ensure_disk_space(dir: &std::path::Path, estimated_bytes: u64, context: &str)
     }
 
     Ok(())
+}
+
+// Runs for the lifetime of the process, polling free space on the
+// --temp-dir volume and printing a warning to stderr if it gets low.
+// ensure_disk_space() already warns/fails at each individual spill
+// checkpoint, but long stretches of work (e.g. the parallel pre-merge, or
+// a big counting pass between spills) can run for a while without hitting
+// one of those checkpoints, during which the temp volume could still be
+// draining from other spill-writer threads. This gives a continuously
+// live signal instead of the first sign of trouble being a hard failure.
+// Intentionally not joined: it's a daemon-style thread that dies with the
+// process on exit.
+fn spawn_disk_space_watchdog(temp_dir: Option<PathBuf>, total_input_bytes: u64) {
+    let watch_dir = temp_dir.unwrap_or_else(std::env::temp_dir);
+    let warn_floor_bytes: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+    // Scale the warning threshold with input size (spilling a bigger input
+    // needs more headroom) but never below the floor, so small jobs don't
+    // get spurious warnings from normal free-space fluctuation.
+    let warn_threshold = (total_input_bytes / 10).max(warn_floor_bytes);
+
+    let _ = std::thread::Builder::new()
+        .name("disk-space-watchdog".to_string())
+        .spawn(move || {
+            let mut last_warned: Option<Instant> = None;
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let Some(avail) = available_space_for(&watch_dir) else {
+                    continue;
+                };
+                if avail < warn_threshold {
+                    let should_warn = match last_warned {
+                        None => true,
+                        Some(t) => t.elapsed() >= Duration::from_secs(30),
+                    };
+                    if should_warn {
+                        eprintln!(
+                            "Warning: temp dir '{}' is running low on space ({:.2} GB free).",
+                            watch_dir.display(),
+                            avail as f64 / (1024.0 * 1024.0 * 1024.0)
+                        );
+                        last_warned = Some(Instant::now());
+                    }
+                }
+            }
+        });
 }
 
 pub enum FinalizedResult {
@@ -708,19 +753,86 @@ fn parallel_merge_counting_runs(
         return Ok(groups.into_iter().flatten().collect());
     }
 
+    let total_groups = groups.len();
     eprintln!(
         "Parallel pre-merge: {} runs -> {} groups across up to {} threads...",
         groups.iter().map(|g| g.len()).sum::<usize>(),
-        groups.len(),
+        total_groups,
         num_threads
     );
 
-    let merged: Vec<tempfile::TempPath> = groups
-        .into_par_iter()
-        .map(|g| merge_dedup_group(&g, temp_dir))
-        .collect::<Result<Vec<_>>>()?;
+    // This stage can run for a long time on large inputs (each group is a
+    // full k-way merge+dedup of its share of the spilled runs) with no
+    // other output in between, which looks identical to a hang. A spinner
+    // with a steady tick (ticks on a timer, independent of any group
+    // actually finishing) plus a position that advances as groups complete
+    // gives a continuously-live, cross-platform-safe indicator that the
+    // program is still working. indicatif renders plain ASCII fallbacks on
+    // terminals that don't support fancier glyphs, so this is safe on any
+    // platform/terminal.
+    let pb = ProgressBar::new(total_groups as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] pre-merge groups: {pos}/{len} ({percent}%)  {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(120));
+    pb.set_message("merging + deduping run groups...");
 
-    Ok(merged)
+    // The merge groups themselves only call ensure_disk_space() once they
+    // go to write their output run, so a temp volume that's draining
+    // during this (potentially long) stage would otherwise go unnoticed
+    // until a write fails outright. Poll free space on the side and surface
+    // a warning through the same progress bar (pb.println keeps the
+    // spinner line intact) instead of letting the failure be the first
+    // sign anything was wrong.
+    let watch_dir = temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+    let stop_watch = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let stop_watch = Arc::clone(&stop_watch);
+        let pb = pb.clone();
+        std::thread::Builder::new()
+            .name("pre-merge-disk-watch".to_string())
+            .spawn(move || {
+                let mut last_warned = false;
+                while !stop_watch.load(AtomicOrdering::Relaxed) {
+                    if let Some(avail) = available_space_for(&watch_dir) {
+                        const LOW_SPACE_WARN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+                        if avail < LOW_SPACE_WARN_BYTES {
+                            if !last_warned {
+                                pb.println(format!(
+                                    "Warning: temp dir '{}' is low on space ({:.2} GB free) during pre-merge.",
+                                    watch_dir.display(),
+                                    avail as f64 / (1024.0 * 1024.0 * 1024.0)
+                                ));
+                                last_warned = true;
+                            }
+                        } else {
+                            last_warned = false;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+            })
+            .expect("failed to spawn pre-merge disk-watch thread")
+    };
+
+    let merged_result: Result<Vec<tempfile::TempPath>> = groups
+        .into_par_iter()
+        .map(|g| {
+            let result = merge_dedup_group(&g, temp_dir);
+            pb.inc(1);
+            result
+        })
+        .collect();
+
+    stop_watch.store(true, AtomicOrdering::Relaxed);
+    let _ = watcher.join();
+    pb.finish_and_clear();
+
+    merged_result
 }
 
 fn stream_merge_and_write(
@@ -1550,6 +1662,13 @@ fn main() -> Result<()> {
     let total_ram = sys.total_memory() as usize;
     let max_mem_bytes = (total_ram as f64 * cli.max_mem) as usize;
 
+    let total_input_bytes: u64 = cli
+        .inputs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+
     {
         let probe_dir = cli
             .temp_dir
@@ -1562,12 +1681,6 @@ fn main() -> Result<()> {
                 probe_dir.display(),
                 avail_gb
             );
-            let total_input_bytes: u64 = cli
-                .inputs
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-                .sum();
             if total_input_bytes > 0 && avail < total_input_bytes {
                 eprintln!(
                     "Warning: free space ({:.2} GB) is less than total input size ({:.2} GB). \
@@ -1576,6 +1689,10 @@ fn main() -> Result<()> {
                     total_input_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
                 );
             }
+            // Keep watching for the rest of the run: a one-time check at
+            // startup can't catch space draining away later during a long
+            // spilling/merging pass (see spawn_disk_space_watchdog).
+            spawn_disk_space_watchdog(cli.temp_dir.clone(), total_input_bytes);
         } else {
             eprintln!(
                 "Warning: could not determine free space for '{}'; disk-space checks during spilling will be skipped.",
